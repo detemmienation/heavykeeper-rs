@@ -1680,4 +1680,94 @@ mod tests {
         assert!(topk.contains_top_k("foo"));
         assert!(!topk.contains_top_k("bar"));
     }
+
+    #[test]
+    fn test_serialize_roundtrip_preserves_state() {
+        let mut original = CuckooTopK::<Vec<u8>>::with_seed(50, 64, 4, 0.9, 42);
+        for i in 0u32..200 {
+            original.add(&format!("key-{i}").into_bytes(), (i as u64) + 1);
+        }
+        let restored =
+            CuckooTopK::<Vec<u8>>::from_bytes(&original.to_bytes(), 42).expect("round-trips");
+
+        assert_eq!(restored.width(), original.width());
+        assert_eq!(restored.depth(), original.depth());
+        assert_eq!(restored.decay(), original.decay());
+        assert_eq!(restored.top_items(), original.top_items());
+        assert_eq!(restored.max_kicks(), original.max_kicks());
+        assert_eq!(restored.list(), original.list());
+        for i in 0u32..200 {
+            let key = format!("key-{i}").into_bytes();
+            assert_eq!(
+                restored.count(&key),
+                original.count(&key),
+                "count mismatch for {key:?}"
+            );
+            assert_eq!(
+                restored.bucket_count(&key),
+                original.bucket_count(&key),
+                "bucket_count mismatch for {key:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_serialize_roundtrip_empty_sketch() {
+        let original = CuckooTopK::<Vec<u8>>::with_seed(10, 64, 4, 0.9, 7);
+        let restored =
+            CuckooTopK::<Vec<u8>>::from_bytes(&original.to_bytes(), 7).expect("round-trips");
+        assert_eq!(restored.list(), original.list());
+        assert!(restored.list().is_empty());
+    }
+
+    #[test]
+    fn test_deserialize_rejects_truncated_stream() {
+        let mut sketch = CuckooTopK::<Vec<u8>>::with_seed(10, 64, 4, 0.9, 42);
+        sketch.add(b"foo".as_slice(), 5);
+        let bytes = sketch.to_bytes();
+        let Err(err) = CuckooTopK::<Vec<u8>>::from_bytes(&bytes[..bytes.len() - 1], 42) else {
+            panic!("truncated stream must fail");
+        };
+        assert!(matches!(err, CuckooDeserializeError::UnexpectedEof { .. }));
+    }
+
+    #[test]
+    fn test_deserialize_rejects_trailing_bytes() {
+        let mut bytes = CuckooTopK::<Vec<u8>>::with_seed(10, 64, 4, 0.9, 42).to_bytes();
+        bytes.push(0xff);
+        let Err(err) = CuckooTopK::<Vec<u8>>::from_bytes(&bytes, 42) else {
+            panic!("trailing bytes must fail");
+        };
+        assert!(matches!(
+            err,
+            CuckooDeserializeError::TrailingBytes { count: 1 }
+        ));
+    }
+
+    #[test]
+    fn test_deserialize_rejects_unsupported_version() {
+        let mut bytes = CuckooTopK::<Vec<u8>>::with_seed(10, 64, 4, 0.9, 42).to_bytes();
+        bytes[0] = VERSION + 1;
+        let Err(err) = CuckooTopK::<Vec<u8>>::from_bytes(&bytes, 42) else {
+            panic!("bad version must fail");
+        };
+        assert!(matches!(
+            err,
+            CuckooDeserializeError::UnsupportedVersion { .. }
+        ));
+    }
+
+    #[test]
+    fn test_deserialize_rejects_zero_width() {
+        let mut bytes = CuckooTopK::<Vec<u8>>::with_seed(10, 64, 4, 0.9, 42).to_bytes();
+        // width is the first u64 right after the 1-byte version.
+        bytes[1..9].copy_from_slice(&0u64.to_le_bytes());
+        let Err(err) = CuckooTopK::<Vec<u8>>::from_bytes(&bytes, 42) else {
+            panic!("zero width must fail");
+        };
+        assert!(matches!(
+            err,
+            CuckooDeserializeError::InvalidField { field: "width", .. }
+        ));
+    }
 }
