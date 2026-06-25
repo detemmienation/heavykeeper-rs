@@ -35,6 +35,10 @@ impl<T: Ord + Clone + Hash + PartialEq> TopKQueue<T> {
         self.items.len()
     }
 
+    pub(crate) fn set_capacity(&mut self, capacity: usize) {
+        self.capacity = capacity;
+    }
+
     /// Returns an estimate of heap memory (in bytes) used by this queue.
     ///
     /// Computed from allocated *capacity* of the `HashMap`, heap vector,

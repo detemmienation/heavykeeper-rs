@@ -58,6 +58,34 @@ pub enum CuckooMergeError {
 }
 
 #[derive(Error, Debug)]
+pub enum CuckooDeserializeError {
+    #[error(
+        "Byte stream too short while reading {field}: need {needed} more byte(s), have {actual}"
+    )]
+    UnexpectedEof {
+        field: &'static str,
+        needed: usize,
+        actual: usize,
+    },
+
+    #[error("Unsupported serialization version {version} (this build expects {expected})")]
+    UnsupportedVersion { version: u8, expected: u8 },
+
+    #[error("Invalid {field} value: {detail}")]
+    InvalidField { field: &'static str, detail: String },
+
+    #[error("Length mismatch for {field}: payload holds {actual} but expected {expected}")]
+    LengthMismatch {
+        field: &'static str,
+        actual: usize,
+        expected: usize,
+    },
+
+    #[error("{count} unexpected trailing byte(s) after the sketch payload")]
+    TrailingBytes { count: usize },
+}
+
+#[derive(Error, Debug)]
 pub enum CuckooBuilderError {
     #[error("Missing required field: {field}")]
     MissingField { field: String },
@@ -763,6 +791,219 @@ impl<T: Ord + Clone + Hash> CuckooTopK<T> {
     }
 }
 
+const VERSION: u8 = 1;
+const CELL_SIZE: usize = 16;
+
+/// Narrow a `u64` to `usize`, erroring on overflow.
+fn decoded_usize(value: u64, field: &'static str) -> Result<usize, CuckooDeserializeError> {
+    usize::try_from(value).map_err(|_| CuckooDeserializeError::InvalidField {
+        field,
+        detail: format!("value {value} exceeds usize range on this platform"),
+    })
+}
+
+/// Parse a `CELL_SIZE`-aligned slice into a boxed cell array.
+fn parse_cells(slice: &[u8]) -> Box<[Cell]> {
+    slice
+        .chunks_exact(CELL_SIZE)
+        .map(|chunk| Cell {
+            fingerprint: u64::from_le_bytes(chunk[0..8].try_into().expect("8 bytes")),
+            count: u64::from_le_bytes(chunk[8..16].try_into().expect("8 bytes")),
+        })
+        .collect()
+}
+
+/// Bounds-checked read of `n` bytes at `*pos`, advancing it.
+fn take<'a>(
+    bytes: &'a [u8],
+    pos: &mut usize,
+    n: usize,
+    field: &'static str,
+) -> Result<&'a [u8], CuckooDeserializeError> {
+    if bytes.len() - *pos < n {
+        return Err(CuckooDeserializeError::UnexpectedEof {
+            field,
+            needed: n,
+            actual: bytes.len() - *pos,
+        });
+    }
+    let slice = &bytes[*pos..*pos + n];
+    *pos += n;
+    Ok(slice)
+}
+
+/// Read a little-endian `u64` at `*pos`, advancing it.
+fn take_u64(
+    bytes: &[u8],
+    pos: &mut usize,
+    field: &'static str,
+) -> Result<u64, CuckooDeserializeError> {
+    Ok(u64::from_le_bytes(
+        take(bytes, pos, 8, field)?
+            .try_into()
+            .expect("slice is 8 bytes"),
+    ))
+}
+
+impl CuckooTopK<Vec<u8>> {
+    /// Serialize the sketch to a byte stream. Layout (little-endian):
+    ///
+    /// ```text
+    /// version: u8
+    /// width, depth, decay(bits), top_items, max_kicks: u64 each
+    /// lobbies:  width        x (fingerprint: u64, count: u64)
+    /// heavy:    width*depth  x (fingerprint: u64, count: u64)
+    /// pq_len: u64
+    /// pq:       pq_len       x (key_len: u64, key bytes, count: u64)
+    /// ```
+    ///
+    /// The seed is not stored; pass it to [`from_bytes`](CuckooTopK::from_bytes).
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let cell_count = self.lobbies.len() + self.heavy.len();
+        let pq_len = self.priority_queue.len();
+        // Capacity hint: header (version + 6 u64s) + cells + pq estimate.
+        let mut out = Vec::with_capacity(1 + 8 * 6 + cell_count * CELL_SIZE + pq_len * 24);
+
+        out.push(VERSION);
+        out.extend_from_slice(&(self.width as u64).to_le_bytes());
+        out.extend_from_slice(&(self.depth as u64).to_le_bytes());
+        out.extend_from_slice(&self.decay.to_bits().to_le_bytes());
+        out.extend_from_slice(&(self.top_items as u64).to_le_bytes());
+        out.extend_from_slice(&(self.max_kicks as u64).to_le_bytes());
+
+        for cell in self.lobbies.iter().chain(self.heavy.iter()) {
+            out.extend_from_slice(&cell.fingerprint.to_le_bytes());
+            out.extend_from_slice(&cell.count.to_le_bytes());
+        }
+
+        out.extend_from_slice(&(pq_len as u64).to_le_bytes());
+        for (item, count) in self.priority_queue.iter() {
+            out.extend_from_slice(&(item.len() as u64).to_le_bytes());
+            out.extend_from_slice(item);
+            out.extend_from_slice(&count.to_le_bytes());
+        }
+
+        out
+    }
+
+    /// Reconstruct a sketch from [`to_bytes`](CuckooTopK::to_bytes) output.
+    /// `seed` must match the sketch's original seed; the hasher and RNG are
+    /// rebuilt from it.
+    pub fn from_bytes(bytes: &[u8], seed: u64) -> Result<Self, CuckooDeserializeError> {
+        let mut pos = 0;
+
+        // Header.
+        let version = take(bytes, &mut pos, 1, "version")?[0];
+        if version != VERSION {
+            return Err(CuckooDeserializeError::UnsupportedVersion {
+                version,
+                expected: VERSION,
+            });
+        }
+        let width = decoded_usize(take_u64(bytes, &mut pos, "width")?, "width")?;
+        let depth = decoded_usize(take_u64(bytes, &mut pos, "depth")?, "depth")?;
+        let decay = f64::from_bits(take_u64(bytes, &mut pos, "decay")?);
+        let top_items = decoded_usize(take_u64(bytes, &mut pos, "top_items")?, "top_items")?;
+        let max_kicks = decoded_usize(take_u64(bytes, &mut pos, "max_kicks")?, "max_kicks")?;
+
+        // Validate scalars before sizing anything off them.
+        if width < 1 {
+            return Err(CuckooDeserializeError::InvalidField {
+                field: "width",
+                detail: format!("must be >= 1, got {width}"),
+            });
+        }
+        if depth < 1 {
+            return Err(CuckooDeserializeError::InvalidField {
+                field: "depth",
+                detail: format!("must be >= 1, got {depth}"),
+            });
+        }
+        if !decay.is_finite() || !(0.0..=1.0).contains(&decay) {
+            return Err(CuckooDeserializeError::InvalidField {
+                field: "decay",
+                detail: format!("must be a finite value in 0.0..=1.0, got {decay}"),
+            });
+        }
+        if max_kicks < 1 {
+            return Err(CuckooDeserializeError::InvalidField {
+                field: "max_kicks",
+                detail: format!("must be >= 1, got {max_kicks}"),
+            });
+        }
+
+        let expected_heavy =
+            width
+                .checked_mul(depth)
+                .ok_or_else(|| CuckooDeserializeError::InvalidField {
+                    field: "width*depth",
+                    detail: format!("overflows usize ({width} * {depth})"),
+                })?;
+
+        // Cells: `take` checks the bytes exist before `parse_cells` allocates,
+        // so a corrupt geometry can't force a huge allocation.
+        let lobby_bytes =
+            width
+                .checked_mul(CELL_SIZE)
+                .ok_or_else(|| CuckooDeserializeError::InvalidField {
+                    field: "lobbies",
+                    detail: format!("size overflows usize (width={width})"),
+                })?;
+        let lobbies = parse_cells(take(bytes, &mut pos, lobby_bytes, "lobbies")?);
+        let heavy_bytes = expected_heavy.checked_mul(CELL_SIZE).ok_or_else(|| {
+            CuckooDeserializeError::InvalidField {
+                field: "heavy",
+                detail: format!("size overflows usize (width*depth={expected_heavy})"),
+            }
+        })?;
+        let heavy = parse_cells(take(bytes, &mut pos, heavy_bytes, "heavy")?);
+
+        // Priority queue: a length prefix, then variable-length entries.
+        let pq_len = decoded_usize(
+            take_u64(bytes, &mut pos, "priority_queue length")?,
+            "priority_queue length",
+        )?;
+        if pq_len > top_items {
+            return Err(CuckooDeserializeError::LengthMismatch {
+                field: "priority queue",
+                actual: pq_len,
+                expected: top_items,
+            });
+        }
+
+        // Rebuild the seed-derived state, then graft the cells and queue on top.
+        // Build the priority queue empty (capacity 0) rather than pre-reserving
+        // `top_items` slots: a corrupt `top_items` then cannot force a huge
+        // allocation. The queue grows on demand as the `pq_len` entries below
+        // are inserted, and the real `k` is restored via `set_capacity`.
+        let mut sketch = Self::with_seed(0, width, depth, decay, seed);
+        sketch.max_kicks = max_kicks;
+        sketch.lobbies = lobbies;
+        sketch.heavy = heavy;
+        sketch.top_items = top_items;
+        sketch.priority_queue.set_capacity(top_items);
+
+        for _ in 0..pq_len {
+            let key_len = decoded_usize(
+                take_u64(bytes, &mut pos, "priority_queue key length")?,
+                "priority_queue key length",
+            )?;
+            let item = take(bytes, &mut pos, key_len, "priority_queue key")?.to_vec();
+            let count = take_u64(bytes, &mut pos, "priority_queue count")?;
+            sketch.priority_queue.upsert(item, count);
+        }
+        sketch.min_pq_count = sketch.priority_queue.min_count();
+
+        if pos != bytes.len() {
+            return Err(CuckooDeserializeError::TrailingBytes {
+                count: bytes.len() - pos,
+            });
+        }
+
+        Ok(sketch)
+    }
+}
+
 pub struct CuckooBuilder<T> {
     k: Option<usize>,
     width: Option<usize>,
@@ -881,8 +1122,14 @@ mod tests {
     fn test_query_alias_delegates_to_contains() {
         let mut topk: CuckooTopK<Vec<u8>> = CuckooTopK::new(10, 64, 3, 0.9);
         topk.add(b"alpha".as_slice(), 5);
-        assert_eq!(topk.query(b"alpha".as_slice()), topk.contains(b"alpha".as_slice()));
-        assert_eq!(topk.query(b"missing".as_slice()), topk.contains(b"missing".as_slice()));
+        assert_eq!(
+            topk.query(b"alpha".as_slice()),
+            topk.contains(b"alpha".as_slice())
+        );
+        assert_eq!(
+            topk.query(b"missing".as_slice()),
+            topk.contains(b"missing".as_slice())
+        );
     }
 
     #[test]
