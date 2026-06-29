@@ -278,13 +278,13 @@ impl<T: Ord + Clone + Hash> TopK<T> {
         let _ = self.add_with_evicted(item, increment);
     }
 
-    pub fn add_with_evicted<Q>(&mut self, item: &Q, increment: u64) -> Option<T>
+    pub fn add_with_evicted<Q>(&mut self, item: &Q, increment: u64) -> (Option<T>, bool)
     where
         T: Borrow<Q>,
         Q: Hash + Eq + ToOwned<Owned = T> + ?Sized,
     {
         if increment == 0 {
-            return None;
+            return (None, false);
         }
         let mut composer = HashComposer::new(&self.hasher, item);
         let mut max_count: u64 = 0;
@@ -334,15 +334,23 @@ impl<T: Ord + Clone + Hash> TopK<T> {
             if max_count > current {
                 self.priority_queue.update_if_present(item, max_count);
             }
-            return None;
+            return (None, false);
+        }
+
+        // All rows rejected the item: no count, so don't track it.
+        if max_count == 0 {
+            return (None, false);
         }
 
         if self.priority_queue.is_full() && max_count <= self.priority_queue.min_count() {
-            return None;
+            return (None, false);
         }
 
+        let had_room = !self.priority_queue.is_full();
         // Clone the item here since we need to store it in the priority queue
-        self.priority_queue.upsert(item.to_owned(), max_count)
+        let evicted = self.priority_queue.upsert(item.to_owned(), max_count);
+        let inserted = evicted.is_some() || had_room;
+        (evicted, inserted)
     }
 
     fn decay_threshold(&self, count: u64) -> u64 {
@@ -373,8 +381,14 @@ impl<T: Ord + Clone + Hash> TopK<T> {
         nodes
     }
 
-    /// Estimated heap memory (in bytes) used by this sketch.
-    pub fn mem_bytes(&self) -> usize {
+    /// Estimated heap memory (in bytes) used by this sketch, including the heap
+    /// each tracked item owns beyond `size_of::<T>()`. `item_heap(t)` returns
+    /// the bytes `t` points to (e.g. `String::capacity`); pass `|_| 0`
+    /// for a `T` that owns no heap.
+    pub fn mem_bytes<F>(&self, item_heap: F) -> usize
+    where
+        F: Fn(&T) -> usize,
+    {
         use std::mem::size_of;
         let outer = self.buckets.capacity() * size_of::<Vec<Bucket>>();
         let rows: usize = self
@@ -385,7 +399,7 @@ impl<T: Ord + Clone + Hash> TopK<T> {
         outer
             + rows
             + self.decay_thresholds.capacity() * size_of::<u64>()
-            + self.priority_queue.mem_bytes()
+            + self.priority_queue.mem_bytes(item_heap)
     }
 
     // Merge another HeavyKeeper into this one
@@ -574,21 +588,21 @@ mod tests {
         let decay = DECAY_LOOKUP_SIZE * std::mem::size_of::<u64>();
         // The per-row Bucket allocations and decay table are accounted for;
         // the outer Vec and priority queue add more on top.
-        assert!(topk.mem_bytes() >= rows + decay);
+        assert!(topk.mem_bytes(|_| 0) >= rows + decay);
     }
 
     #[test]
     fn test_mem_bytes_grows_with_width() {
         let small: TopK<Vec<u8>> = TopK::new(10, 100, 5, 0.9);
         let large: TopK<Vec<u8>> = TopK::new(10, 400, 5, 0.9);
-        assert!(large.mem_bytes() > small.mem_bytes());
+        assert!(large.mem_bytes(|_| 0) > small.mem_bytes(|_| 0));
     }
 
     #[test]
     fn test_mem_bytes_grows_with_depth() {
         let shallow: TopK<Vec<u8>> = TopK::new(10, 100, 2, 0.9);
         let deep: TopK<Vec<u8>> = TopK::new(10, 100, 8, 0.9);
-        assert!(deep.mem_bytes() > shallow.mem_bytes());
+        assert!(deep.mem_bytes(|_| 0) > shallow.mem_bytes(|_| 0));
     }
 
     /// Tests basic initialization of TopK with default parameters
@@ -1511,14 +1525,14 @@ mod tests {
     fn test_add_with_evicted_returns_displaced_item() {
         let mut topk: TopK<Vec<u8>> = TopK::new(2, 100, 5, 0.9);
 
-        assert!(topk.add_with_evicted(&b"a".to_vec(), 5).is_none());
-        assert!(topk.add_with_evicted(&b"b".to_vec(), 10).is_none());
+        // New keys into free space: no eviction, but inserted.
+        assert_eq!(topk.add_with_evicted(&b"a".to_vec(), 5), (None, true));
+        assert_eq!(topk.add_with_evicted(&b"b".to_vec(), 10), (None, true));
         assert_eq!(topk.list().len(), 2);
 
-        let evicted = topk
-            .add_with_evicted(&b"c".to_vec(), 20)
-            .expect("expected an eviction");
-        assert_eq!(evicted, b"a".to_vec());
+        let (evicted, inserted) = topk.add_with_evicted(&b"c".to_vec(), 20);
+        assert_eq!(evicted.expect("expected an eviction"), b"a".to_vec());
+        assert!(inserted);
 
         let items: Vec<_> = topk.list().iter().map(|n| n.item.clone()).collect();
         assert!(items.contains(&b"b".to_vec()));
@@ -1530,20 +1544,20 @@ mod tests {
     fn test_add_with_evicted_no_eviction_cases() {
         let mut topk: TopK<Vec<u8>> = TopK::new(2, 100, 5, 0.9);
 
-        // increment == 0 → no work, no eviction.
-        assert!(topk.add_with_evicted(&b"a".to_vec(), 0).is_none());
+        // increment == 0 → no work, nothing tracked.
+        assert_eq!(topk.add_with_evicted(&b"a".to_vec(), 0), (None, false));
 
-        // PQ not yet full → no eviction.
-        assert!(topk.add_with_evicted(&b"a".to_vec(), 5).is_none());
-        assert!(topk.add_with_evicted(&b"b".to_vec(), 10).is_none());
+        // PQ not yet full → no eviction, but inserted.
+        assert_eq!(topk.add_with_evicted(&b"a".to_vec(), 5), (None, true));
+        assert_eq!(topk.add_with_evicted(&b"b".to_vec(), 10), (None, true));
 
-        // Updating an already-tracked item → no eviction even at capacity.
-        assert!(topk.add_with_evicted(&b"a".to_vec(), 1).is_none());
+        // Updating an already-tracked item → neither evicted nor inserted.
+        assert_eq!(topk.add_with_evicted(&b"a".to_vec(), 1), (None, false));
 
-        // New item whose count cannot beat the PQ minimum → no eviction.
+        // New item whose count cannot beat the PQ minimum → nothing tracked.
         let mut topk: TopK<Vec<u8>> = TopK::new(2, 100, 5, 0.9);
         topk.add_with_evicted(&b"hot".to_vec(), 50);
         topk.add_with_evicted(&b"warm".to_vec(), 30);
-        assert!(topk.add_with_evicted(&b"cold".to_vec(), 10).is_none());
+        assert_eq!(topk.add_with_evicted(&b"cold".to_vec(), 10), (None, false));
     }
 }
