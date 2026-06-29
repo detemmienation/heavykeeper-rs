@@ -829,11 +829,12 @@ fn take<'a>(
     n: usize,
     field: &'static str,
 ) -> Result<&'a [u8], CuckooDeserializeError> {
-    if bytes.len() - *pos < n {
+    let available = bytes.len().saturating_sub(*pos);
+    if available < n {
         return Err(CuckooDeserializeError::UnexpectedEof {
             field,
             needed: n,
-            actual: bytes.len() - *pos,
+            actual: available,
         });
     }
     let slice = &bytes[*pos..*pos + n];
@@ -981,16 +982,17 @@ impl CuckooTopK<Vec<u8>> {
         }
 
         // Rebuild the seed-derived state, then graft the cells and queue on top.
-        // Build the priority queue empty (capacity 0) rather than pre-reserving
-        // `top_items` slots: a corrupt `top_items` then cannot force a huge
-        // allocation. The queue grows on demand as the `pq_len` entries below
-        // are inserted, and the real `k` is restored via `set_capacity`.
-        let mut sketch = Self::with_seed(0, width, depth, decay, seed);
+        // Reserve the original `top_items` capacity so a round-trip is identical
+        // in size to the original.
+        //
+        // OOM TRADEOFF: unlike the cell/key allocations (gated by `take`), this
+        // is sized by the unbounded `top_items` header, so a tampered stream
+        // could force a huge reserve. Fine for restoring our own dumps (RDB); if
+        // ever fed untrusted bytes, bound `top_items` first.
+        let mut sketch = Self::with_seed(top_items, width, depth, decay, seed);
         sketch.max_kicks = max_kicks;
         sketch.lobbies = lobbies;
         sketch.heavy = heavy;
-        sketch.top_items = top_items;
-        sketch.priority_queue.set_capacity(top_items);
 
         for _ in 0..pq_len {
             let key_len = decoded_usize(
