@@ -12,8 +12,10 @@ use std::fmt::Debug;
 use std::hash::Hash;
 
 use ahash::RandomState;
-use rand::rngs::SmallRng;
-use rand::{RngCore, SeedableRng};
+// Import RNG traits from `rand_xoshiro`'s re-exported `rand_core` (0.10, not the
+// 0.9 `rand` uses); in 0.10 `next_u64` is on `Rng`, not `RngCore`.
+use rand_xoshiro::rand_core::{Rng, SeedableRng};
+use rand_xoshiro::Xoshiro256PlusPlus;
 use thiserror::Error;
 
 use crate::priority_queue::TopKQueue;
@@ -160,7 +162,7 @@ pub struct CuckooTopK<T: Ord + Clone + Hash> {
     decay_thresholds: Box<[u64]>,
     priority_queue: TopKQueue<T>,
     hasher: RandomState,
-    rng: SmallRng,
+    rng: Xoshiro256PlusPlus,
     min_pq_count: u64,
     top_items: usize,
     max_kicks: usize,
@@ -187,7 +189,7 @@ impl<T: Ord + Clone + Hash> CuckooTopK<T> {
             depth,
             decay,
             hasher,
-            SmallRng::seed_from_u64(seed),
+            Xoshiro256PlusPlus::seed_from_u64(seed),
             DEFAULT_MAX_CUCKOO_KICKS,
         )
     }
@@ -209,7 +211,7 @@ impl<T: Ord + Clone + Hash> CuckooTopK<T> {
             depth,
             decay,
             hasher,
-            SmallRng::seed_from_u64(0),
+            Xoshiro256PlusPlus::seed_from_u64(0),
             DEFAULT_MAX_CUCKOO_KICKS,
         )
     }
@@ -225,7 +227,7 @@ impl<T: Ord + Clone + Hash> CuckooTopK<T> {
         depth: usize,
         decay: f64,
         hasher: RandomState,
-        rng: SmallRng,
+        rng: Xoshiro256PlusPlus,
         max_kicks: usize,
     ) -> Self {
         let width_mask = if width > 1 && width.is_power_of_two() {
@@ -802,6 +804,8 @@ impl<T: Ord + Clone + Hash> CuckooTopK<T> {
 
 const VERSION: u8 = 1;
 const CELL_SIZE: usize = 16;
+/// Bytes in a serialized `Xoshiro256PlusPlus` state (256-bit, little-endian).
+const RNG_STATE_SIZE: usize = 32;
 
 /// Narrow a `u64` to `usize`, erroring on overflow.
 fn decoded_usize(value: u64, field: &'static str) -> Result<usize, CuckooDeserializeError> {
@@ -865,14 +869,18 @@ impl CuckooTopK<Vec<u8>> {
     /// heavy:    width*depth  x (fingerprint: u64, count: u64)
     /// pq_len: u64
     /// pq:       pq_len       x (key_len: u64, key bytes, count: u64)
+    /// rng_state: 32 bytes
     /// ```
     ///
-    /// The seed is not stored; pass it to [`from_bytes`](CuckooTopK::from_bytes).
+    /// The seed is not stored; the hasher is rebuilt from the seed passed to
+    /// [`from_bytes`](CuckooTopK::from_bytes). The RNG position is stored 
+    /// (`rng_state`) and restored exactly.
     pub fn to_bytes(&self) -> Vec<u8> {
         let cell_count = self.lobbies.len() + self.heavy.len();
         let pq_len = self.priority_queue.len();
-        // Capacity hint: header (version + 6 u64s) + cells + pq estimate.
-        let mut out = Vec::with_capacity(1 + 8 * 6 + cell_count * CELL_SIZE + pq_len * 24);
+        // Capacity hint: header (version + 5 u64s) + cells + pq_len u64 + pq estimate + rng.
+        let mut out =
+            Vec::with_capacity(1 + 8 * 6 + cell_count * CELL_SIZE + pq_len * 24 + RNG_STATE_SIZE);
 
         out.push(VERSION);
         out.extend_from_slice(&(self.width as u64).to_le_bytes());
@@ -892,13 +900,13 @@ impl CuckooTopK<Vec<u8>> {
             out.extend_from_slice(item);
             out.extend_from_slice(&count.to_le_bytes());
         }
+        out.extend_from_slice(&self.rng.state());
 
         out
     }
 
     /// Reconstruct a sketch from [`to_bytes`](CuckooTopK::to_bytes) output.
-    /// `seed` must match the sketch's original seed; the hasher and RNG are
-    /// rebuilt from it.
+    /// `seed` must match the sketch's original seed; the hasher rebuilt from it.
     pub fn from_bytes(bytes: &[u8], seed: u64) -> Result<Self, CuckooDeserializeError> {
         let mut pos = 0;
 
@@ -1005,6 +1013,12 @@ impl CuckooTopK<Vec<u8>> {
         }
         sketch.min_pq_count = sketch.priority_queue.min_count();
 
+        // Restore the RNG position. 
+        let rng_state: [u8; RNG_STATE_SIZE] = take(bytes, &mut pos, RNG_STATE_SIZE, "rng_state")?
+            .try_into()
+            .expect("slice is RNG_STATE_SIZE bytes");
+        sketch.rng = Xoshiro256PlusPlus::from_seed(rng_state);
+
         if pos != bytes.len() {
             return Err(CuckooDeserializeError::TrailingBytes {
                 count: bytes.len() - pos,
@@ -1109,7 +1123,7 @@ impl<T: Ord + Clone + Hash> CuckooBuilder<T> {
                 RandomState::new()
             }
         });
-        let rng = SmallRng::seed_from_u64(self.seed.unwrap_or(0));
+        let rng = Xoshiro256PlusPlus::seed_from_u64(self.seed.unwrap_or(0));
         Ok(CuckooTopK::with_components(
             k, width, depth, decay, hasher, rng, max_kicks,
         ))
@@ -1784,5 +1798,45 @@ mod tests {
             err,
             CuckooDeserializeError::InvalidField { field: "width", .. }
         ));
+    }
+
+    /// Regression: a restored sketch must resume the RNG where the original
+    /// left off, or identical follow-up traffic makes them diverge (the
+    /// primary/replica full-sync case).
+    #[test]
+    fn test_serialize_preserves_rng_position_no_divergence() {
+        // Small width + high decay churn forces the decay path to consume RNG.
+        let mut original = CuckooTopK::<Vec<u8>>::with_seed(20, 16, 2, 0.9, 42);
+        for i in 0u32..500 {
+            original.add(&format!("warmup-{}", i % 40).into_bytes(), 3);
+        }
+
+        let mut restored =
+            CuckooTopK::<Vec<u8>>::from_bytes(&original.to_bytes(), 42).expect("round-trips");
+
+        // Feed identical follow-up traffic to both copies.
+        for i in 0u32..500 {
+            let key = format!("live-{}", i % 40).into_bytes();
+            original.add(&key, 3);
+            restored.add(&key, 3);
+        }
+
+        // Full state (incl. rng_state) is more sensitive than `list()` alone.
+        assert_eq!(
+            restored.to_bytes(),
+            original.to_bytes(),
+            "restored sketch diverged from original after identical traffic"
+        );
+    }
+
+    #[test]
+    fn test_serialize_appends_rng_state() {
+        let empty = CuckooTopK::<Vec<u8>>::with_seed(10, 64, 4, 0.9, 42);
+        let bytes = empty.to_bytes();
+        // Header (version + 5 u64s) + lobbies + heavy + pq_len + rng state.
+        let header = 1 + 8 * 5;
+        let cells = (64 + 64 * 4) * CELL_SIZE;
+        let pq_len = 8;
+        assert_eq!(bytes.len(), header + cells + pq_len + RNG_STATE_SIZE);
     }
 }
