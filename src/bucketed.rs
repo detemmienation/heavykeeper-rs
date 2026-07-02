@@ -7,8 +7,10 @@ use std::fmt::Debug;
 use std::hash::Hash;
 
 use ahash::RandomState;
-use rand::rngs::SmallRng;
-use rand::{RngCore, SeedableRng};
+// Import RNG traits from `rand_xoshiro`'s re-exported `rand_core` (0.10, not the
+// 0.9 `rand` uses); in 0.10 `next_u64` is on `Rng`, not `RngCore`.
+use rand_xoshiro::rand_core::{Rng, SeedableRng};
+use rand_xoshiro::Xoshiro256PlusPlus;
 use thiserror::Error;
 
 use crate::priority_queue::TopKQueue;
@@ -102,7 +104,7 @@ pub struct BucketedTopK<T: Ord + Clone + Hash> {
     decay_thresholds: Box<[u64]>,
     priority_queue: TopKQueue<T>,
     hasher: RandomState,
-    rng: SmallRng,
+    rng: Xoshiro256PlusPlus,
     min_pq_count: u64,
     top_items: usize,
 }
@@ -125,7 +127,14 @@ impl<T: Ord + Clone + Hash> BucketedTopK<T> {
         decay: f64,
         hasher: RandomState,
     ) -> Self {
-        Self::with_components(k, width, depth, decay, hasher, SmallRng::seed_from_u64(0))
+        Self::with_components(
+            k,
+            width,
+            depth,
+            decay,
+            hasher,
+            Xoshiro256PlusPlus::seed_from_u64(0),
+        )
     }
 
     pub fn builder() -> BucketedBuilder<T> {
@@ -138,7 +147,7 @@ impl<T: Ord + Clone + Hash> BucketedTopK<T> {
         depth: usize,
         decay: f64,
         hasher: RandomState,
-        rng: SmallRng,
+        rng: Xoshiro256PlusPlus,
     ) -> Self {
         let priority_queue = TopKQueue::with_capacity_and_hasher(k, hasher.clone());
         let width_mask = if width > 1 && width.is_power_of_two() {
@@ -590,7 +599,7 @@ impl<T: Ord + Clone + Hash> BucketedBuilder<T> {
                 RandomState::new()
             }
         });
-        let rng = SmallRng::seed_from_u64(self.seed.unwrap_or(0));
+        let rng = Xoshiro256PlusPlus::seed_from_u64(self.seed.unwrap_or(0));
         Ok(BucketedTopK::with_components(
             k, width, depth, decay, hasher, rng,
         ))

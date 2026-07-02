@@ -1,8 +1,10 @@
 use crate::hash_composition::HashComposer;
 use crate::priority_queue::TopKQueue;
 use ahash::RandomState;
-use rand::rngs::SmallRng;
-use rand::{RngCore, SeedableRng};
+// Import RNG traits from `rand_xoshiro`'s re-exported `rand_core` (0.10, not the
+// 0.9 `rand` uses); in 0.10 `next_u64` is on `Rng`, not `RngCore`.
+use rand_xoshiro::rand_core::{Rng, SeedableRng};
+use rand_xoshiro::Xoshiro256PlusPlus;
 use std::borrow::Borrow;
 use std::clone::Clone;
 use std::fmt::Debug;
@@ -79,7 +81,7 @@ pub struct TopK<T: Ord + Clone + Hash> {
     buckets: Vec<Vec<Bucket>>,
     priority_queue: TopKQueue<T>,
     hasher: RandomState,
-    random: SmallRng,
+    random: Xoshiro256PlusPlus,
 }
 
 pub struct Builder<T> {
@@ -117,7 +119,14 @@ impl<T: Ord + Clone + Hash> TopK<T> {
     // New constructor that takes a seed
     pub fn with_seed(k: usize, width: usize, depth: usize, decay: f64, seed: u64) -> Self {
         let hasher = RandomState::with_seeds(seed, seed, seed, seed);
-        Self::with_components(k, width, depth, decay, hasher, SmallRng::seed_from_u64(seed))
+        Self::with_components(
+            k,
+            width,
+            depth,
+            decay,
+            hasher,
+            Xoshiro256PlusPlus::seed_from_u64(seed),
+        )
     }
 
     pub fn with_hasher(
@@ -127,7 +136,14 @@ impl<T: Ord + Clone + Hash> TopK<T> {
         decay: f64,
         hasher: RandomState,
     ) -> Self {
-        Self::with_components(k, width, depth, decay, hasher, SmallRng::seed_from_u64(0))
+        Self::with_components(
+            k,
+            width,
+            depth,
+            decay,
+            hasher,
+            Xoshiro256PlusPlus::seed_from_u64(0),
+        )
     }
 
     fn with_components(
@@ -136,7 +152,7 @@ impl<T: Ord + Clone + Hash> TopK<T> {
         depth: usize,
         decay: f64,
         hasher: RandomState,
-        rng: SmallRng,
+        rng: Xoshiro256PlusPlus,
     ) -> Self {
         // Pre-allocate with capacity to avoid resizing
         let mut buckets = Vec::with_capacity(depth);
@@ -571,7 +587,7 @@ impl<T: Ord + Clone + Hash> Builder<T> {
             }
         });
 
-        let rng = SmallRng::seed_from_u64(self.seed.unwrap_or(0));
+        let rng = Xoshiro256PlusPlus::seed_from_u64(self.seed.unwrap_or(0));
 
         Ok(TopK::with_components(k, width, depth, decay, hasher, rng))
     }
@@ -1374,7 +1390,10 @@ mod tests {
             9,
             "Item1 bucket count should be 9 after decay"
         );
-        assert!(!topk.contains(&item2), "Item2 should not be in the bucket yet");
+        assert!(
+            !topk.contains(&item2),
+            "Item2 should not be in the bucket yet"
+        );
         assert_eq!(
             topk.bucket_count(&item2),
             0,
