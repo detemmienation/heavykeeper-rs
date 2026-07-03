@@ -8,7 +8,9 @@ mod heavykeeper;
 pub use heavykeeper::{TopK, TopKDeserializeError, TopKNode};
 
 mod bucketed;
-pub use bucketed::{BucketedBuilderError, BucketedMergeError, BucketedNode, BucketedTopK};
+pub use bucketed::{
+    BucketedBuilderError, BucketedDeserializeError, BucketedMergeError, BucketedNode, BucketedTopK,
+};
 
 mod cuckoo;
 pub use cuckoo::{

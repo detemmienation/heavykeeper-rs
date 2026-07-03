@@ -78,6 +78,34 @@ pub enum BucketedBuilderError {
     InvalidDecay { decay: f64 },
 }
 
+#[derive(Error, Debug)]
+pub enum BucketedDeserializeError {
+    #[error(
+        "Byte stream too short while reading {field}: need {needed} more byte(s), have {actual}"
+    )]
+    UnexpectedEof {
+        field: &'static str,
+        needed: usize,
+        actual: usize,
+    },
+
+    #[error("Unsupported serialization version {version} (this build expects {expected})")]
+    UnsupportedVersion { version: u8, expected: u8 },
+
+    #[error("Invalid {field} value: {detail}")]
+    InvalidField { field: &'static str, detail: String },
+
+    #[error("Length mismatch for {field}: payload holds {actual} but expected {expected}")]
+    LengthMismatch {
+        field: &'static str,
+        actual: usize,
+        expected: usize,
+    },
+
+    #[error("{count} unexpected trailing byte(s) after the sketch payload")]
+    TrailingBytes { count: usize },
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug)]
 struct Cell {
@@ -497,6 +525,204 @@ impl<T: Ord + Clone + Hash> BucketedTopK<T> {
         let r = (count % divisor) as usize;
         let rem_thr = tbl[r] as f64 / u64::MAX as f64;
         ((last.powf(q) * rem_thr) * u64::MAX as f64) as u64
+    }
+}
+
+const VERSION: u8 = 1;
+const CELL_SIZE: usize = 16;
+const RNG_STATE_SIZE: usize = 32;
+
+/// Narrow a `u64` to `usize`, erroring on overflow.
+fn decoded_usize(value: u64, field: &'static str) -> Result<usize, BucketedDeserializeError> {
+    usize::try_from(value).map_err(|_| BucketedDeserializeError::InvalidField {
+        field,
+        detail: format!("value {value} exceeds usize range on this platform"),
+    })
+}
+
+/// Parse a `CELL_SIZE`-aligned slice into a boxed cell array.
+fn parse_cells(slice: &[u8]) -> Box<[Cell]> {
+    slice
+        .chunks_exact(CELL_SIZE)
+        .map(|chunk| Cell {
+            fingerprint: u64::from_le_bytes(chunk[0..8].try_into().expect("8 bytes")),
+            count: u64::from_le_bytes(chunk[8..16].try_into().expect("8 bytes")),
+        })
+        .collect()
+}
+
+/// Bounds-checked read of `n` bytes at `*pos`, advancing it.
+fn take<'a>(
+    bytes: &'a [u8],
+    pos: &mut usize,
+    n: usize,
+    field: &'static str,
+) -> Result<&'a [u8], BucketedDeserializeError> {
+    let available = bytes.len().saturating_sub(*pos);
+    if available < n {
+        return Err(BucketedDeserializeError::UnexpectedEof {
+            field,
+            needed: n,
+            actual: available,
+        });
+    }
+    let slice = &bytes[*pos..*pos + n];
+    *pos += n;
+    Ok(slice)
+}
+
+/// Read a little-endian `u64` at `*pos`, advancing it.
+fn take_u64(
+    bytes: &[u8],
+    pos: &mut usize,
+    field: &'static str,
+) -> Result<u64, BucketedDeserializeError> {
+    Ok(u64::from_le_bytes(
+        take(bytes, pos, 8, field)?
+            .try_into()
+            .expect("slice is 8 bytes"),
+    ))
+}
+
+impl BucketedTopK<Vec<u8>> {
+    /// Serialize the sketch to a byte stream. Layout (little-endian):
+    ///
+    /// ```text
+    /// version: u8
+    /// width, depth, decay(bits), top_items: u64 each
+    /// cells:    width*depth  x (fingerprint: u64, count: u64)
+    /// pq_len: u64
+    /// pq:       pq_len       x (key_len: u64, key bytes, count: u64)
+    /// rng_state: 32 bytes
+    /// ```
+    ///
+    /// The seed is not stored; the hasher is rebuilt from the seed passed to
+    /// [`from_bytes`](BucketedTopK::from_bytes). The RNG position is stored
+    /// (`rng_state`) and restored exactly.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let pq_len = self.priority_queue.len();
+        let mut out = Vec::with_capacity(
+            1 + 8 * 4 + self.cells.len() * CELL_SIZE + pq_len * 24 + RNG_STATE_SIZE,
+        );
+
+        out.push(VERSION);
+        out.extend_from_slice(&(self.width as u64).to_le_bytes());
+        out.extend_from_slice(&(self.depth as u64).to_le_bytes());
+        out.extend_from_slice(&self.decay.to_bits().to_le_bytes());
+        out.extend_from_slice(&(self.top_items as u64).to_le_bytes());
+
+        for cell in self.cells.iter() {
+            out.extend_from_slice(&cell.fingerprint.to_le_bytes());
+            out.extend_from_slice(&cell.count.to_le_bytes());
+        }
+
+        // Serialize in insertion-`sequence` order (not count order) so restore
+        // preserves the count-tie ordering; see `TopKQueue::iter_by_sequence`.
+        out.extend_from_slice(&(pq_len as u64).to_le_bytes());
+        for (item, count) in self.priority_queue.iter_by_sequence() {
+            out.extend_from_slice(&(item.len() as u64).to_le_bytes());
+            out.extend_from_slice(item);
+            out.extend_from_slice(&count.to_le_bytes());
+        }
+        out.extend_from_slice(&self.rng.state());
+
+        out
+    }
+
+    /// Reconstruct a sketch from [`to_bytes`](BucketedTopK::to_bytes) output.
+    /// `seed` must match the sketch's original seed; the hasher rebuilt from it.
+    pub fn from_bytes(bytes: &[u8], seed: u64) -> Result<Self, BucketedDeserializeError> {
+        let mut pos = 0;
+
+        let version = take(bytes, &mut pos, 1, "version")?[0];
+        if version != VERSION {
+            return Err(BucketedDeserializeError::UnsupportedVersion {
+                version,
+                expected: VERSION,
+            });
+        }
+        let width = decoded_usize(take_u64(bytes, &mut pos, "width")?, "width")?;
+        let depth = decoded_usize(take_u64(bytes, &mut pos, "depth")?, "depth")?;
+        let decay = f64::from_bits(take_u64(bytes, &mut pos, "decay")?);
+        let top_items = decoded_usize(take_u64(bytes, &mut pos, "top_items")?, "top_items")?;
+
+        // Validate scalars before sizing anything off them.
+        if width < 1 {
+            return Err(BucketedDeserializeError::InvalidField {
+                field: "width",
+                detail: format!("must be >= 1, got {width}"),
+            });
+        }
+        if depth < 1 {
+            return Err(BucketedDeserializeError::InvalidField {
+                field: "depth",
+                detail: format!("must be >= 1, got {depth}"),
+            });
+        }
+        if !decay.is_finite() || !(0.0..=1.0).contains(&decay) {
+            return Err(BucketedDeserializeError::InvalidField {
+                field: "decay",
+                detail: format!("must be a finite value in 0.0..=1.0, got {decay}"),
+            });
+        }
+
+        // `take` checks the bytes exist before `parse_cells` allocates, so a
+        // corrupt geometry can't force a huge allocation.
+        let cell_count =
+            width
+                .checked_mul(depth)
+                .ok_or_else(|| BucketedDeserializeError::InvalidField {
+                    field: "width*depth",
+                    detail: format!("overflows usize ({width} * {depth})"),
+                })?;
+        let cell_bytes = cell_count.checked_mul(CELL_SIZE).ok_or_else(|| {
+            BucketedDeserializeError::InvalidField {
+                field: "cells",
+                detail: format!("size overflows usize (width*depth={cell_count})"),
+            }
+        })?;
+        let cells = parse_cells(take(bytes, &mut pos, cell_bytes, "cells")?);
+
+        let pq_len = decoded_usize(
+            take_u64(bytes, &mut pos, "priority_queue length")?,
+            "priority_queue length",
+        )?;
+        if pq_len > top_items {
+            return Err(BucketedDeserializeError::LengthMismatch {
+                field: "priority queue",
+                actual: pq_len,
+                expected: top_items,
+            });
+        }
+
+        // The `top_items` reserve is an unbounded-header OOM tradeoff; see
+        // `CuckooTopK::from_bytes`.
+        let mut sketch = Self::with_seed(top_items, width, depth, decay, seed);
+        sketch.cells = cells;
+
+        for _ in 0..pq_len {
+            let key_len = decoded_usize(
+                take_u64(bytes, &mut pos, "priority_queue key length")?,
+                "priority_queue key length",
+            )?;
+            let item = take(bytes, &mut pos, key_len, "priority_queue key")?.to_vec();
+            let count = take_u64(bytes, &mut pos, "priority_queue count")?;
+            sketch.priority_queue.upsert(item, count);
+        }
+        sketch.min_pq_count = sketch.priority_queue.min_count();
+
+        let rng_state: [u8; RNG_STATE_SIZE] = take(bytes, &mut pos, RNG_STATE_SIZE, "rng_state")?
+            .try_into()
+            .expect("slice is RNG_STATE_SIZE bytes");
+        sketch.rng = Xoshiro256PlusPlus::from_seed(rng_state);
+
+        if pos != bytes.len() {
+            return Err(BucketedDeserializeError::TrailingBytes {
+                count: bytes.len() - pos,
+            });
+        }
+
+        Ok(sketch)
     }
 }
 
@@ -1182,5 +1408,168 @@ mod tests {
         topk.add_with_evicted(&b"hot".to_vec(), 50);
         topk.add_with_evicted(&b"warm".to_vec(), 30);
         assert_eq!(topk.add_with_evicted(&b"cold".to_vec(), 10), (None, false));
+    }
+
+    #[test]
+    fn test_serialize_roundtrip_preserves_state() {
+        let mut original = BucketedTopK::<Vec<u8>>::with_seed(50, 64, 4, 0.9, 42);
+        for i in 0u32..200 {
+            original.add(&format!("key-{i}").into_bytes(), (i as u64) + 1);
+        }
+        let restored =
+            BucketedTopK::<Vec<u8>>::from_bytes(&original.to_bytes(), 42).expect("round-trips");
+
+        assert_eq!(restored.width, original.width);
+        assert_eq!(restored.depth, original.depth);
+        assert_eq!(restored.decay, original.decay);
+        assert_eq!(restored.top_items, original.top_items);
+        assert_eq!(restored.list(), original.list());
+        for i in 0u32..200 {
+            let key = format!("key-{i}").into_bytes();
+            assert_eq!(
+                restored.count(&key),
+                original.count(&key),
+                "count mismatch for {key:?}"
+            );
+            assert_eq!(
+                restored.bucket_count(&key),
+                original.bucket_count(&key),
+                "bucket_count mismatch for {key:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_serialize_roundtrip_empty_sketch() {
+        let original = BucketedTopK::<Vec<u8>>::with_seed(10, 64, 4, 0.9, 7);
+        let restored =
+            BucketedTopK::<Vec<u8>>::from_bytes(&original.to_bytes(), 7).expect("round-trips");
+        assert_eq!(restored.list(), original.list());
+        assert!(restored.list().is_empty());
+    }
+
+    #[test]
+    fn test_deserialize_rejects_truncated_stream() {
+        let mut sketch = BucketedTopK::<Vec<u8>>::with_seed(10, 64, 4, 0.9, 42);
+        sketch.add(b"foo".as_slice(), 5);
+        let bytes = sketch.to_bytes();
+        let Err(err) = BucketedTopK::<Vec<u8>>::from_bytes(&bytes[..bytes.len() - 1], 42) else {
+            panic!("truncated stream must fail");
+        };
+        assert!(matches!(
+            err,
+            BucketedDeserializeError::UnexpectedEof { .. }
+        ));
+    }
+
+    #[test]
+    fn test_deserialize_rejects_trailing_bytes() {
+        let mut bytes = BucketedTopK::<Vec<u8>>::with_seed(10, 64, 4, 0.9, 42).to_bytes();
+        bytes.push(0xff);
+        let Err(err) = BucketedTopK::<Vec<u8>>::from_bytes(&bytes, 42) else {
+            panic!("trailing bytes must fail");
+        };
+        assert!(matches!(
+            err,
+            BucketedDeserializeError::TrailingBytes { count: 1 }
+        ));
+    }
+
+    #[test]
+    fn test_deserialize_rejects_unsupported_version() {
+        let mut bytes = BucketedTopK::<Vec<u8>>::with_seed(10, 64, 4, 0.9, 42).to_bytes();
+        bytes[0] = VERSION + 1;
+        let Err(err) = BucketedTopK::<Vec<u8>>::from_bytes(&bytes, 42) else {
+            panic!("bad version must fail");
+        };
+        assert!(matches!(
+            err,
+            BucketedDeserializeError::UnsupportedVersion { .. }
+        ));
+    }
+
+    #[test]
+    fn test_deserialize_rejects_zero_width() {
+        let mut bytes = BucketedTopK::<Vec<u8>>::with_seed(10, 64, 4, 0.9, 42).to_bytes();
+        // width is the first u64 right after the 1-byte version.
+        bytes[1..9].copy_from_slice(&0u64.to_le_bytes());
+        let Err(err) = BucketedTopK::<Vec<u8>>::from_bytes(&bytes, 42) else {
+            panic!("zero width must fail");
+        };
+        assert!(matches!(
+            err,
+            BucketedDeserializeError::InvalidField { field: "width", .. }
+        ));
+    }
+
+    /// Regression: a restored sketch must resume the RNG where the original
+    /// left off, or identical follow-up traffic makes them diverge (the
+    /// primary/replica full-sync case).
+    #[test]
+    fn test_serialize_preserves_rng_position_no_divergence() {
+        // Small width + high decay churn forces the decay path to consume RNG.
+        let mut original = BucketedTopK::<Vec<u8>>::with_seed(20, 16, 2, 0.9, 42);
+        for i in 0u32..500 {
+            original.add(&format!("warmup-{}", i % 40).into_bytes(), 3);
+        }
+
+        let mut restored =
+            BucketedTopK::<Vec<u8>>::from_bytes(&original.to_bytes(), 42).expect("round-trips");
+
+        // Feed identical follow-up traffic to both copies.
+        for i in 0u32..500 {
+            let key = format!("live-{}", i % 40).into_bytes();
+            original.add(&key, 3);
+            restored.add(&key, 3);
+        }
+
+        // Full state (incl. rng_state) is more sensitive than `list()` alone.
+        assert_eq!(
+            restored.to_bytes(),
+            original.to_bytes(),
+            "restored sketch diverged from original after identical traffic"
+        );
+    }
+
+    #[test]
+    fn test_serialize_appends_rng_state() {
+        let empty = BucketedTopK::<Vec<u8>>::with_seed(10, 64, 4, 0.9, 42);
+        let bytes = empty.to_bytes();
+        // Header (version + 4 u64s) + cells + pq_len + rng state.
+        let header = 1 + 8 * 4;
+        let cells = 64 * 4 * CELL_SIZE;
+        let pq_len = 8;
+        assert_eq!(bytes.len(), header + cells + pq_len + RNG_STATE_SIZE);
+    }
+
+    /// Regression: equal-count items must keep their order across a round-trip.
+    /// `a` is inserted first but has the lower count at snapshot time; count-order
+    /// serialization would flip the tie once follow-up traffic levels the counts.
+    #[test]
+    fn test_serialize_preserves_pq_tie_order() {
+        // Wide sketch so fingerprints don't collide and counts stay exact.
+        let mut original = BucketedTopK::<Vec<u8>>::with_seed(4, 1024, 4, 0.9, 42);
+        original.add(b"a".as_slice(), 10); // inserted first (lower sequence)
+        original.add(b"b".as_slice(), 20); // inserted second, higher count
+
+        let mut restored =
+            BucketedTopK::<Vec<u8>>::from_bytes(&original.to_bytes(), 42).expect("round-trips");
+
+        // Identical follow-up traffic levels the counts, forming a tie.
+        original.add(b"a".as_slice(), 10);
+        restored.add(b"a".as_slice(), 10);
+
+        let order =
+            |s: &BucketedTopK<Vec<u8>>| s.list().into_iter().map(|n| n.item).collect::<Vec<_>>();
+        assert_eq!(
+            order(&restored),
+            order(&original),
+            "equal-count items must keep their order across a round-trip"
+        );
+        assert_eq!(
+            restored.to_bytes(),
+            original.to_bytes(),
+            "restored sketch diverged from original after identical traffic"
+        );
     }
 }
