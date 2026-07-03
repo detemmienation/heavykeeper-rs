@@ -895,7 +895,7 @@ impl CuckooTopK<Vec<u8>> {
         }
 
         out.extend_from_slice(&(pq_len as u64).to_le_bytes());
-        for (item, count) in self.priority_queue.iter() {
+        for (item, count) in self.priority_queue.iter_by_sequence() {
             out.extend_from_slice(&(item.len() as u64).to_le_bytes());
             out.extend_from_slice(item);
             out.extend_from_slice(&count.to_le_bytes());
@@ -1838,5 +1838,37 @@ mod tests {
         let cells = (64 + 64 * 4) * CELL_SIZE;
         let pq_len = 8;
         assert_eq!(bytes.len(), header + cells + pq_len + RNG_STATE_SIZE);
+    }
+
+    /// Regression: equal-count items must keep their order across a round-trip.
+    /// `a` is inserted first but has the lower count at snapshot time; count-order
+    /// serialization would flip the tie once follow-up traffic levels the counts.
+    #[test]
+    fn test_serialize_preserves_pq_tie_order() {
+        // Wide sketch so fingerprints don't collide and counts stay exact.
+        let mut original = CuckooTopK::<Vec<u8>>::with_seed(4, 1024, 4, 0.9, 42);
+        original.add(b"a".as_slice(), 10); // inserted first (lower sequence)
+        original.add(b"b".as_slice(), 20); // inserted second, higher count
+
+        let mut restored =
+            CuckooTopK::<Vec<u8>>::from_bytes(&original.to_bytes(), 42).expect("round-trips");
+
+        // Identical follow-up traffic levels the counts, forming a tie.
+        original.add(b"a".as_slice(), 10);
+        restored.add(b"a".as_slice(), 10);
+
+        let order = |s: &CuckooTopK<Vec<u8>>| {
+            s.list().into_iter().map(|n| n.item).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            order(&restored),
+            order(&original),
+            "equal-count items must keep their order across a round-trip"
+        );
+        assert_eq!(
+            restored.to_bytes(),
+            original.to_bytes(),
+            "restored sketch diverged from original after identical traffic"
+        );
     }
 }
