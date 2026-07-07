@@ -20,6 +20,25 @@ use crate::priority_queue::TopKQueue;
 
 const DECAY_LOOKUP_SIZE: usize = 1024;
 
+/// Callback relocating one heap allocation, given its `(ptr, size, align)`.
+/// Returns the same pointer or a fresh equal-size block with the bytes copied over.
+pub type ReallocFn = fn(ptr: *mut u8, size: usize, align: usize) -> *mut u8;
+
+/// Reallocate the allocation backing `slot` through `realloc`, in place.
+/// `Box<[E]>` has no spare capacity, so its byte length is exactly `len * size_of::<E>()`.
+fn realloc_large_heap_allocated_object<E>(slot: &mut Box<[E]>, realloc: ReallocFn) {
+    use std::mem::{align_of, size_of};
+    let len = slot.len();
+    if len == 0 {
+        return; 
+    }
+    // `mem::take` leaves an empty box, so nothing dangles if `realloc` panics.
+    let ptr = Box::into_raw(std::mem::take(slot)) as *mut u8;
+    let new = realloc(ptr, len * size_of::<E>(), align_of::<E>());
+    assert!(!new.is_null(), "ReallocFn must not return a null pointer");
+    *slot = unsafe { Box::from_raw(std::slice::from_raw_parts_mut(new as *mut E, len)) };
+}
+
 /// Default upper bound on the cuckoo kick chain. Higher values raise the
 /// effective load factor of the heavy slots (fewer silent drops on
 /// collision) at the cost of worst-case work per `add`. Override with
@@ -550,6 +569,17 @@ impl<T: Ord + Clone + Hash> CuckooTopK<T> {
 
         self.min_pq_count = self.priority_queue.min_count();
         Ok(())
+    }
+
+    /// Relocate the sketch's large heap allocations through `realloc`, for a
+    /// host running active memory defragmentation. Each block is passed to
+    /// `realloc` and replaced by the pointer it returns; see [`ReallocFn`].
+    ///
+    /// Relocates the `lobbies` and `heavy` bucket arrays and the decay table. 
+    pub fn realloc_large_heap_allocated_objects(&mut self, realloc: ReallocFn) {
+        realloc_large_heap_allocated_object(&mut self.lobbies, realloc);
+        realloc_large_heap_allocated_object(&mut self.heavy, realloc);
+        realloc_large_heap_allocated_object(&mut self.decay_thresholds, realloc);
     }
 
     #[inline]
