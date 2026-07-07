@@ -28,7 +28,7 @@ pub type ReallocFn = fn(ptr: *mut u8, size: usize, align: usize) -> *mut u8;
 
 /// Reallocate the allocation backing `slot` through `realloc`, in place.
 /// `Box<[E]>` has no spare capacity, so its byte length is exactly `len * size_of::<E>()`.
-fn realloc_large_heap_allocated_object<E>(slot: &mut Box<[E]>, realloc: ReallocFn) {
+pub(crate) fn realloc_large_heap_allocated_object<E>(slot: &mut Box<[E]>, realloc: ReallocFn) {
     use std::mem::{align_of, size_of};
     let len = slot.len();
     if len == 0 {
@@ -605,11 +605,14 @@ impl<T: Ord + Clone + Hash> CuckooTopK<T> {
     /// host running active memory defragmentation. Each block is passed to
     /// `realloc` and replaced by the pointer it returns; see [`ReallocFn`].
     ///
-    /// Relocates the `lobbies` and `heavy` bucket arrays and the decay table. 
+    /// Relocates the `lobbies` and `heavy` bucket arrays, the decay table, and
+    /// the priority queue's contiguous vectors.
     pub fn realloc_large_heap_allocated_objects(&mut self, realloc: ReallocFn) {
         realloc_large_heap_allocated_object(&mut self.lobbies, realloc);
         realloc_large_heap_allocated_object(&mut self.heavy, realloc);
         realloc_large_heap_allocated_object(&mut self.decay_thresholds, realloc);
+        self.priority_queue
+            .realloc_large_heap_allocated_objects(realloc);
     }
 
     #[inline]
