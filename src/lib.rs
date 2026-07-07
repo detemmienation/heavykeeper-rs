@@ -13,9 +13,7 @@ pub use bucketed::{
 };
 
 mod cuckoo;
-pub use cuckoo::{
-    CuckooBuilderError, CuckooDeserializeError, CuckooMergeError, CuckooNode, CuckooTopK,
-};
+pub use cuckoo::{CuckooBuilderError, CuckooDeserializeError, CuckooMergeError, CuckooNode, CuckooTopK, ReallocFn};
 
 mod hash_composition;
 mod priority_queue;
