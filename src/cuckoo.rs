@@ -1904,4 +1904,63 @@ mod tests {
             "restored sketch diverged from original after identical traffic"
         );
     }
+
+    #[test]
+    fn test_realloc_identity_preserves_contents() {
+        let mut sketch = CuckooTopK::<Vec<u8>>::with_seed(8, 256, 4, 0.9, 42);
+        for i in 0..500u32 {
+            sketch.add(&format!("key-{i}").into_bytes(), (i as u64 % 13) + 1);
+        }
+        let before = sketch.to_bytes();
+        let list_before = sketch.list();
+
+        // Identity realloc: leave every block in place.
+        sketch.realloc_large_heap_allocated_objects(|ptr, _, _| ptr);
+
+        assert_eq!(sketch.to_bytes(), before, "identity realloc changed bytes");
+        assert_eq!(sketch.list(), list_before, "identity realloc changed list");
+    }
+
+    #[test]
+    fn test_realloc_relocating_preserves_contents() {
+        let mut sketch = CuckooTopK::<Vec<u8>>::with_seed(8, 256, 4, 0.9, 42);
+        let mut reference = CuckooTopK::<Vec<u8>>::with_seed(8, 256, 4, 0.9, 42);
+        for i in 0..500u32 {
+            let key = format!("key-{i}").into_bytes();
+            sketch.add(&key, (i as u64 % 13) + 1);
+            reference.add(&key, (i as u64 % 13) + 1);
+        }
+        let before = sketch.to_bytes();
+        let list_before = sketch.list();
+
+        // Genuinely move every block: alloc a fresh region, copy the bytes, free
+        // the old block — standing in for a host allocator relocating during
+        // defragmentation. A non-capturing closure coerces to `ReallocFn`.
+        sketch.realloc_large_heap_allocated_objects(|ptr, size, align| {
+            use std::alloc::{alloc, dealloc, Layout};
+            let layout = Layout::from_size_align(size, align).expect("valid layout");
+            unsafe {
+                let new = alloc(layout);
+                assert!(!new.is_null(), "test allocator OOM");
+                std::ptr::copy_nonoverlapping(ptr, new, size);
+                dealloc(ptr, layout);
+                new
+            }
+        });
+
+        assert_eq!(sketch.to_bytes(), before, "relocating realloc changed bytes");
+        assert_eq!(sketch.list(), list_before, "relocating realloc changed list");
+
+        // The sketch must remain fully usable after every block has moved.
+        for i in 0..200u32 {
+            let key = format!("post-{i}").into_bytes();
+            sketch.add(&key, (i as u64 % 7) + 1);
+            reference.add(&key, (i as u64 % 7) + 1);
+        }
+        assert_eq!(
+            sketch.to_bytes(),
+            reference.to_bytes(),
+            "sketch diverged from reference after post-relocation traffic"
+        );
+    }
 }
