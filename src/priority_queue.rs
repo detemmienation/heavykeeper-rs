@@ -3,6 +3,17 @@ use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::hash::Hash;
 
+use crate::cuckoo::{realloc_large_heap_allocated_object, ReallocFn};
+
+/// Relocate `vec`'s backing allocation through `realloc`, in place. Trimmed to
+/// a boxed slice first to drop spare capacity; the rebuilt `Vec` has capacity
+/// equal to its length.
+fn realloc_vec<E>(vec: &mut Vec<E>, realloc: ReallocFn) {
+    let mut boxed = std::mem::take(vec).into_boxed_slice();
+    realloc_large_heap_allocated_object(&mut boxed, realloc);
+    *vec = boxed.into_vec();
+}
+
 /// A specialized priority queue for HeavyKeeper that maintains top-k items by count
 #[derive(Clone)]
 pub(crate) struct TopKQueue<T> {
@@ -81,6 +92,12 @@ impl<T: Ord + Clone + Hash + PartialEq> TopKQueue<T> {
             + self.item_store.capacity() * size_of::<T>()
             + self.free_slots.capacity() * size_of::<usize>()
             + 2 * item_bytes
+    }
+
+    /// Relocate the `heap` and `free_slots` vectors through `realloc`.
+    pub(crate) fn realloc_large_heap_allocated_objects(&mut self, realloc: ReallocFn) {
+        realloc_vec(&mut self.heap, realloc);
+        realloc_vec(&mut self.free_slots, realloc);
     }
 
     pub(crate) fn get<Q>(&self, item: &Q) -> Option<u64>
