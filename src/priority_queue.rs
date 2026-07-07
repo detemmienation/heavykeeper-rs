@@ -94,10 +94,15 @@ impl<T: Ord + Clone + Hash + PartialEq> TopKQueue<T> {
             + 2 * item_bytes
     }
 
-    /// Relocate the `heap` and `free_slots` vectors through `realloc`.
+    /// Relocate the `heap`, `free_slots`, and `item_store` vectors through
+    /// `realloc`. For `item_store`, only the outer buffer of `T` values is
+    /// moved; any heap a `T` owns (e.g. a `Vec<u8>` key's bytes) remains in
+    /// place, since those elements are byte-copied without modification.
+    /// The `items` map is not relocated.
     pub(crate) fn realloc_large_heap_allocated_objects(&mut self, realloc: ReallocFn) {
         realloc_vec(&mut self.heap, realloc);
         realloc_vec(&mut self.free_slots, realloc);
+        realloc_vec(&mut self.item_store, realloc);
     }
 
     pub(crate) fn get<Q>(&self, item: &Q) -> Option<u64>
