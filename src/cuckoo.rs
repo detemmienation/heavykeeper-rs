@@ -22,23 +22,21 @@ use crate::priority_queue::TopKQueue;
 
 const DECAY_LOOKUP_SIZE: usize = 1024;
 
-/// Callback relocating one heap allocation, given its `(ptr, size, align)`.
-/// Returns the same pointer or a fresh equal-size block with the bytes copied over.
-pub type ReallocFn = fn(ptr: *mut u8, size: usize, align: usize) -> *mut u8;
+/// Relocates the sketch's large heap allocations for a host running active
+/// memory defragmentation. One generic method covers every element type, so
+/// the sketch's private types need not be named by the caller.
+pub trait Reallocator {
+    /// Relocate `boxed`, returning an equal-length, equal-contents `Box<[T]>`.
+    fn realloc<T>(&mut self, boxed: Box<[T]>) -> Box<[T]>;
+}
 
-/// Reallocate the allocation backing `slot` through `realloc`, in place.
-/// `Box<[E]>` has no spare capacity, so its byte length is exactly `len * size_of::<E>()`.
-pub(crate) fn realloc_large_heap_allocated_object<E>(slot: &mut Box<[E]>, realloc: ReallocFn) {
-    use std::mem::{align_of, size_of};
-    let len = slot.len();
-    if len == 0 {
-        return; 
-    }
-    // `mem::take` leaves an empty box, so nothing dangles if `realloc` panics.
-    let ptr = Box::into_raw(std::mem::take(slot)) as *mut u8;
-    let new = realloc(ptr, len * size_of::<E>(), align_of::<E>());
-    assert!(!new.is_null(), "ReallocFn must not return a null pointer");
-    *slot = unsafe { Box::from_raw(std::slice::from_raw_parts_mut(new as *mut E, len)) };
+/// Relocate the allocation backing `slot` through `reallocator`, in place.
+pub(crate) fn realloc_large_heap_allocated_object<E, R: Reallocator>(
+    slot: &mut Box<[E]>,
+    reallocator: &mut R,
+) {
+    // `mem::take` leaves an empty box, so nothing dangles if `reallocator` panics.
+    *slot = reallocator.realloc(std::mem::take(slot));
 }
 
 /// Default upper bound on the cuckoo kick chain. Higher values raise the
@@ -601,18 +599,18 @@ impl<T: Ord + Clone + Hash> CuckooTopK<T> {
         Ok(())
     }
 
-    /// Relocate the sketch's large heap allocations through `realloc`, for a
-    /// host running active memory defragmentation. Each block is passed to
-    /// `realloc` and replaced by the pointer it returns; see [`ReallocFn`].
-    ///
-    /// Relocates the `lobbies` and `heavy` bucket arrays, the decay table, and
-    /// the priority queue's contiguous vectors.
-    pub fn realloc_large_heap_allocated_objects(&mut self, realloc: ReallocFn) {
-        realloc_large_heap_allocated_object(&mut self.lobbies, realloc);
-        realloc_large_heap_allocated_object(&mut self.heavy, realloc);
-        realloc_large_heap_allocated_object(&mut self.decay_thresholds, realloc);
+    /// Relocate the sketch's large heap allocations through `reallocator` (see
+    /// [`Reallocator`]): the `lobbies` and `heavy` bucket arrays, the decay
+    /// table, and the priority queue's vectors. Logical contents (counts,
+    /// tracked items, query results) are unchanged. Not panic-atomic: if
+    /// `reallocator` panics partway through, the sketch may be left logically
+    /// inconsistent.
+    pub fn realloc_large_heap_allocated_objects<R: Reallocator>(&mut self, reallocator: &mut R) {
+        realloc_large_heap_allocated_object(&mut self.lobbies, reallocator);
+        realloc_large_heap_allocated_object(&mut self.heavy, reallocator);
+        realloc_large_heap_allocated_object(&mut self.decay_thresholds, reallocator);
         self.priority_queue
-            .realloc_large_heap_allocated_objects(realloc);
+            .realloc_large_heap_allocated_objects(reallocator);
     }
 
     #[inline]
@@ -906,7 +904,7 @@ impl CuckooTopK<Vec<u8>> {
     /// ```
     ///
     /// The seed is not stored; the hasher is rebuilt from the seed passed to
-    /// [`from_bytes`](CuckooTopK::from_bytes). The RNG position is stored 
+    /// [`from_bytes`](CuckooTopK::from_bytes). The RNG position is stored
     /// (`rng_state`) and restored exactly.
     pub fn to_bytes(&self) -> Vec<u8> {
         let cell_count = self.lobbies.len() + self.heavy.len();
@@ -1046,7 +1044,7 @@ impl CuckooTopK<Vec<u8>> {
         }
         sketch.min_pq_count = sketch.priority_queue.min_count();
 
-        // Restore the RNG position. 
+        // Restore the RNG position.
         let rng_state: [u8; RNG_STATE_SIZE] = take(bytes, &mut pos, RNG_STATE_SIZE, "rng_state")?
             .try_into()
             .expect("slice is RNG_STATE_SIZE bytes");
@@ -1890,9 +1888,8 @@ mod tests {
         original.add(b"a".as_slice(), 10);
         restored.add(b"a".as_slice(), 10);
 
-        let order = |s: &CuckooTopK<Vec<u8>>| {
-            s.list().into_iter().map(|n| n.item).collect::<Vec<_>>()
-        };
+        let order =
+            |s: &CuckooTopK<Vec<u8>>| s.list().into_iter().map(|n| n.item).collect::<Vec<_>>();
         assert_eq!(
             order(&restored),
             order(&original),
@@ -1905,6 +1902,37 @@ mod tests {
         );
     }
 
+    /// A `Reallocator` that leaves every block in place.
+    struct Identity;
+    impl Reallocator for Identity {
+        fn realloc<T>(&mut self, boxed: Box<[T]>) -> Box<[T]> {
+            boxed
+        }
+    }
+
+    /// A `Reallocator` that genuinely moves every block (alloc fresh, copy,
+    /// free the old block), standing in for a host allocator relocating during
+    /// defragmentation.
+    struct Relocating;
+    impl Reallocator for Relocating {
+        fn realloc<T>(&mut self, boxed: Box<[T]>) -> Box<[T]> {
+            let len = boxed.len();
+            if len == 0 || std::mem::size_of::<T>() == 0 {
+                return boxed;
+            }
+            use std::alloc::{alloc, dealloc, Layout};
+            let layout = Layout::array::<T>(len).expect("valid layout");
+            let old = Box::into_raw(boxed) as *mut u8;
+            unsafe {
+                let new = alloc(layout);
+                assert!(!new.is_null(), "test allocator OOM");
+                std::ptr::copy_nonoverlapping(old, new, layout.size());
+                dealloc(old, layout);
+                Box::from_raw(std::ptr::slice_from_raw_parts_mut(new as *mut T, len))
+            }
+        }
+    }
+
     #[test]
     fn test_realloc_identity_preserves_contents() {
         let mut sketch = CuckooTopK::<Vec<u8>>::with_seed(8, 256, 4, 0.9, 42);
@@ -1914,8 +1942,7 @@ mod tests {
         let before = sketch.to_bytes();
         let list_before = sketch.list();
 
-        // Identity realloc: leave every block in place.
-        sketch.realloc_large_heap_allocated_objects(|ptr, _, _| ptr);
+        sketch.realloc_large_heap_allocated_objects(&mut Identity);
 
         assert_eq!(sketch.to_bytes(), before, "identity realloc changed bytes");
         assert_eq!(sketch.list(), list_before, "identity realloc changed list");
@@ -1933,23 +1960,18 @@ mod tests {
         let before = sketch.to_bytes();
         let list_before = sketch.list();
 
-        // Genuinely move every block: alloc a fresh region, copy the bytes, free
-        // the old block — standing in for a host allocator relocating during
-        // defragmentation. A non-capturing closure coerces to `ReallocFn`.
-        sketch.realloc_large_heap_allocated_objects(|ptr, size, align| {
-            use std::alloc::{alloc, dealloc, Layout};
-            let layout = Layout::from_size_align(size, align).expect("valid layout");
-            unsafe {
-                let new = alloc(layout);
-                assert!(!new.is_null(), "test allocator OOM");
-                std::ptr::copy_nonoverlapping(ptr, new, size);
-                dealloc(ptr, layout);
-                new
-            }
-        });
+        sketch.realloc_large_heap_allocated_objects(&mut Relocating);
 
-        assert_eq!(sketch.to_bytes(), before, "relocating realloc changed bytes");
-        assert_eq!(sketch.list(), list_before, "relocating realloc changed list");
+        assert_eq!(
+            sketch.to_bytes(),
+            before,
+            "relocating realloc changed bytes"
+        );
+        assert_eq!(
+            sketch.list(),
+            list_before,
+            "relocating realloc changed list"
+        );
 
         // The sketch must remain fully usable after every block has moved.
         for i in 0..200u32 {

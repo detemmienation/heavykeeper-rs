@@ -3,14 +3,14 @@ use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::hash::Hash;
 
-use crate::cuckoo::{realloc_large_heap_allocated_object, ReallocFn};
+use crate::cuckoo::{realloc_large_heap_allocated_object, Reallocator};
 
-/// Relocate `vec`'s backing allocation through `realloc`, in place. Trimmed to
-/// a boxed slice first to drop spare capacity; the rebuilt `Vec` has capacity
-/// equal to its length.
-fn realloc_vec<E>(vec: &mut Vec<E>, realloc: ReallocFn) {
+/// Relocate `vec`'s backing allocation through `reallocator`, in place. Trimmed
+/// to a boxed slice first to drop spare capacity; the rebuilt `Vec` has
+/// capacity equal to its length.
+fn realloc_vec<E, R: Reallocator>(vec: &mut Vec<E>, reallocator: &mut R) {
     let mut boxed = std::mem::take(vec).into_boxed_slice();
-    realloc_large_heap_allocated_object(&mut boxed, realloc);
+    realloc_large_heap_allocated_object(&mut boxed, reallocator);
     *vec = boxed.into_vec();
 }
 
@@ -95,14 +95,16 @@ impl<T: Ord + Clone + Hash + PartialEq> TopKQueue<T> {
     }
 
     /// Relocate the `heap`, `free_slots`, and `item_store` vectors through
-    /// `realloc`. For `item_store`, only the outer buffer of `T` values is
-    /// moved; any heap a `T` owns (e.g. a `Vec<u8>` key's bytes) remains in
-    /// place, since those elements are byte-copied without modification.
-    /// The `items` map is not relocated.
-    pub(crate) fn realloc_large_heap_allocated_objects(&mut self, realloc: ReallocFn) {
-        realloc_vec(&mut self.heap, realloc);
-        realloc_vec(&mut self.free_slots, realloc);
-        realloc_vec(&mut self.item_store, realloc);
+    /// `reallocator`. For `item_store` only the outer buffer moves; any heap a
+    /// `T` owns (e.g. a `Vec<u8>` key's bytes) stays put, as elements are
+    /// copied byte-for-byte. The `items` map is not relocated.
+    pub(crate) fn realloc_large_heap_allocated_objects<R: Reallocator>(
+        &mut self,
+        reallocator: &mut R,
+    ) {
+        realloc_vec(&mut self.heap, reallocator);
+        realloc_vec(&mut self.free_slots, reallocator);
+        realloc_vec(&mut self.item_store, reallocator);
     }
 
     pub(crate) fn get<Q>(&self, item: &Q) -> Option<u64>
