@@ -20,23 +20,21 @@ use crate::priority_queue::TopKQueue;
 
 const DECAY_LOOKUP_SIZE: usize = 1024;
 
-/// Callback relocating one heap allocation, given its `(ptr, size, align)`.
-/// Returns the same pointer or a fresh equal-size block with the bytes copied over.
-pub type ReallocFn = fn(ptr: *mut u8, size: usize, align: usize) -> *mut u8;
+/// Relocates the sketch's large heap allocations for a host running active
+/// memory defragmentation. One generic method covers every element type, so
+/// the sketch's private types need not be named by the caller. 
+pub trait Reallocator {
+    /// Relocate `boxed`, returning an equal-length, equal-contents `Box<[T]>`.
+    fn realloc<T>(&mut self, boxed: Box<[T]>) -> Box<[T]>;
+}
 
-/// Reallocate the allocation backing `slot` through `realloc`, in place.
-/// `Box<[E]>` has no spare capacity, so its byte length is exactly `len * size_of::<E>()`.
-pub(crate) fn realloc_large_heap_allocated_object<E>(slot: &mut Box<[E]>, realloc: ReallocFn) {
-    use std::mem::{align_of, size_of};
-    let len = slot.len();
-    if len == 0 {
-        return; 
-    }
-    // `mem::take` leaves an empty box, so nothing dangles if `realloc` panics.
-    let ptr = Box::into_raw(std::mem::take(slot)) as *mut u8;
-    let new = realloc(ptr, len * size_of::<E>(), align_of::<E>());
-    assert!(!new.is_null(), "ReallocFn must not return a null pointer");
-    *slot = unsafe { Box::from_raw(std::slice::from_raw_parts_mut(new as *mut E, len)) };
+/// Relocate the allocation backing `slot` through `reallocator`, in place.
+pub(crate) fn realloc_large_heap_allocated_object<E, R: Reallocator>(
+    slot: &mut Box<[E]>,
+    reallocator: &mut R,
+) {
+    // `mem::take` leaves an empty box, so nothing dangles if `reallocator` panics.
+    *slot = reallocator.realloc(std::mem::take(slot));
 }
 
 /// Default upper bound on the cuckoo kick chain. Higher values raise the
@@ -571,18 +569,18 @@ impl<T: Ord + Clone + Hash> CuckooTopK<T> {
         Ok(())
     }
 
-    /// Relocate the sketch's large heap allocations through `realloc`, for a
-    /// host running active memory defragmentation. Each block is passed to
-    /// `realloc` and replaced by the pointer it returns; see [`ReallocFn`].
-    ///
-    /// Relocates the `lobbies` and `heavy` bucket arrays, the decay table, and
-    /// the priority queue's contiguous vectors.
-    pub fn realloc_large_heap_allocated_objects(&mut self, realloc: ReallocFn) {
-        realloc_large_heap_allocated_object(&mut self.lobbies, realloc);
-        realloc_large_heap_allocated_object(&mut self.heavy, realloc);
-        realloc_large_heap_allocated_object(&mut self.decay_thresholds, realloc);
+    /// Relocate the sketch's large heap allocations through `reallocator` (see
+    /// [`Reallocator`]): the `lobbies` and `heavy` bucket arrays, the decay
+    /// table, and the priority queue's vectors. Logical contents (counts,
+    /// tracked items, query results) are unchanged. Not panic-atomic: if
+    /// `reallocator` panics partway through, the sketch may be left logically
+    /// inconsistent.
+    pub fn realloc_large_heap_allocated_objects<R: Reallocator>(&mut self, reallocator: &mut R) {
+        realloc_large_heap_allocated_object(&mut self.lobbies, reallocator);
+        realloc_large_heap_allocated_object(&mut self.heavy, reallocator);
+        realloc_large_heap_allocated_object(&mut self.decay_thresholds, reallocator);
         self.priority_queue
-            .realloc_large_heap_allocated_objects(realloc);
+            .realloc_large_heap_allocated_objects(reallocator);
     }
 
     #[inline]

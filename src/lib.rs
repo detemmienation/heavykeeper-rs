@@ -11,7 +11,7 @@ mod bucketed;
 pub use bucketed::{BucketedBuilderError, BucketedMergeError, BucketedNode, BucketedTopK};
 
 mod cuckoo;
-pub use cuckoo::{CuckooBuilderError, CuckooMergeError, CuckooNode, CuckooTopK, ReallocFn};
+pub use cuckoo::{CuckooBuilderError, CuckooMergeError, CuckooNode, CuckooTopK, Reallocator};
 
 mod hash_composition;
 mod priority_queue;
