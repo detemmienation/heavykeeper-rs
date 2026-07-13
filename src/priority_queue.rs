@@ -178,6 +178,16 @@ impl<T: Ord + Clone + Hash + PartialEq> TopKQueue<T> {
 
         // For new items, if we have space just add it
         if self.len() < self.capacity {
+            // Restore capacity to k after a defrag trimmed it, so it stays a
+            // known constant for memory tracking.
+            if self.heap.capacity() < self.capacity + 1 {
+                self.heap.reserve_exact(self.capacity + 1 - self.heap.len());
+            }
+            if self.item_store.capacity() < self.capacity {
+                self.item_store
+                    .reserve_exact(self.capacity - self.item_store.len());
+            }
+
             let pos = self.heap.len();
             self.sequence += 1;
 
