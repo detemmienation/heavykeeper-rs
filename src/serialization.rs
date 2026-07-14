@@ -1,5 +1,6 @@
 //! Shared byte-serialization error, constants, and readers for all variants.
 
+use ahash::RandomState;
 use thiserror::Error;
 
 /// Error returned by every variant's `from_bytes` (aliased per variant).
@@ -51,43 +52,104 @@ pub(crate) const CELL_SIZE: usize = 16;
 /// Bytes in a serialized `Xoshiro256PlusPlus` state (256-bit, little-endian).
 pub(crate) const RNG_STATE_SIZE: usize = 32;
 
-/// Narrow a `u64` to `usize`, erroring on overflow.
-pub(crate) fn decoded_usize(value: u64, field: &'static str) -> Result<usize, DeserializeError> {
-    usize::try_from(value).map_err(|_| DeserializeError::InvalidField {
-        field,
-        detail: format!("value {value} exceeds usize range on this platform"),
-    })
-}
-
-/// Bounds-checked read of `n` bytes at `*pos`, advancing it.
-pub(crate) fn take<'a>(
+/// A forward-only cursor over a serialized payload. Every read is
+/// bounds-checked and advances the cursor, so `from_bytes` never touches raw
+/// offsets and a truncated stream fails with a precise `UnexpectedEof`.
+pub(crate) struct ByteReader<'a> {
     bytes: &'a [u8],
-    pos: &mut usize,
-    n: usize,
-    field: &'static str,
-) -> Result<&'a [u8], DeserializeError> {
-    let available = bytes.len().saturating_sub(*pos);
-    if available < n {
-        return Err(DeserializeError::UnexpectedEof {
-            field,
-            needed: n,
-            actual: available,
-        });
-    }
-    let slice = &bytes[*pos..*pos + n];
-    *pos += n;
-    Ok(slice)
+    pos: usize,
 }
 
-/// Read a little-endian `u64` at `*pos`, advancing it.
-pub(crate) fn take_u64(
-    bytes: &[u8],
-    pos: &mut usize,
-    field: &'static str,
-) -> Result<u64, DeserializeError> {
-    Ok(u64::from_le_bytes(
-        take(bytes, pos, 8, field)?
-            .try_into()
-            .expect("slice is 8 bytes"),
-    ))
+impl<'a> ByteReader<'a> {
+    pub(crate) fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, pos: 0 }
+    }
+
+    /// Read `n` bytes, advancing the cursor.
+    pub(crate) fn take(&mut self, n: usize, field: &'static str) -> Result<&'a [u8], DeserializeError> {
+        let available = self.bytes.len().saturating_sub(self.pos);
+        if available < n {
+            return Err(DeserializeError::UnexpectedEof {
+                field,
+                needed: n,
+                actual: available,
+            });
+        }
+        let slice = &self.bytes[self.pos..self.pos + n];
+        self.pos += n;
+        Ok(slice)
+    }
+
+    /// Read a fixed-size byte array.
+    pub(crate) fn take_array<const N: usize>(
+        &mut self,
+        field: &'static str,
+    ) -> Result<[u8; N], DeserializeError> {
+        Ok(self.take(N, field)?.try_into().expect("slice is N bytes"))
+    }
+
+    /// Read a single byte.
+    pub(crate) fn take_u8(&mut self, field: &'static str) -> Result<u8, DeserializeError> {
+        Ok(self.take(1, field)?[0])
+    }
+
+    /// Read a little-endian `u64`.
+    pub(crate) fn take_u64(&mut self, field: &'static str) -> Result<u64, DeserializeError> {
+        Ok(u64::from_le_bytes(self.take_array::<8>(field)?))
+    }
+
+    /// Read a little-endian `u64` and narrow it to `usize`, erroring on overflow.
+    pub(crate) fn take_usize(&mut self, field: &'static str) -> Result<usize, DeserializeError> {
+        let value = self.take_u64(field)?;
+        usize::try_from(value).map_err(|_| DeserializeError::InvalidField {
+            field,
+            detail: format!("value {value} exceeds usize range on this platform"),
+        })
+    }
+
+    /// Verify the fixed header shared by every variant: magic, `variant` tag,
+    /// version, and the hasher probe. Rebuilds the hasher from `seed` and
+    /// rejects a wrong seed before any geometry is parsed.
+    pub(crate) fn read_header(&mut self, variant: u8, seed: u64) -> Result<(), DeserializeError> {
+        let magic = self.take_array::<4>("magic")?;
+        if magic != MAGIC {
+            return Err(DeserializeError::BadMagic {
+                expected: MAGIC,
+                actual: magic,
+            });
+        }
+        let got_variant = self.take_u8("variant")?;
+        if got_variant != variant {
+            return Err(DeserializeError::WrongVariant {
+                expected: variant,
+                actual: got_variant,
+            });
+        }
+        let version = self.take_u8("version")?;
+        if version != VERSION {
+            return Err(DeserializeError::UnsupportedVersion {
+                version,
+                expected: VERSION,
+            });
+        }
+        let expected_probe = self.take_u64("hasher_probe")?;
+        let actual_probe = RandomState::with_seeds(seed, seed, seed, seed).hash_one(SERIALIZE_HASHER_PROBE);
+        if actual_probe != expected_probe {
+            return Err(DeserializeError::HasherMismatch {
+                expected: expected_probe,
+                actual: actual_probe,
+            });
+        }
+        Ok(())
+    }
+
+    /// Reject any bytes left after the payload.
+    pub(crate) fn finish(&self) -> Result<(), DeserializeError> {
+        if self.pos != self.bytes.len() {
+            return Err(DeserializeError::TrailingBytes {
+                count: self.bytes.len() - self.pos,
+            });
+        }
+        Ok(())
+    }
 }

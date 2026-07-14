@@ -573,47 +573,13 @@ impl BucketedTopK<Vec<u8>> {
     /// Reconstruct a sketch from [`to_bytes`](BucketedTopK::to_bytes) output.
     /// `seed` must match the sketch's original seed; the hasher rebuilt from it.
     pub fn from_bytes(bytes: &[u8], seed: u64) -> Result<Self, BucketedDeserializeError> {
-        let mut pos = 0;
+        let mut reader = ByteReader::new(bytes);
+        reader.read_header(VARIANT, seed)?;
 
-        let magic: [u8; 4] = take(bytes, &mut pos, MAGIC.len(), "magic")?
-            .try_into()
-            .expect("slice is 4 bytes");
-        if magic != MAGIC {
-            return Err(BucketedDeserializeError::BadMagic {
-                expected: MAGIC,
-                actual: magic,
-            });
-        }
-        let variant = take(bytes, &mut pos, 1, "variant")?[0];
-        if variant != VARIANT {
-            return Err(BucketedDeserializeError::WrongVariant {
-                expected: VARIANT,
-                actual: variant,
-            });
-        }
-        let version = take(bytes, &mut pos, 1, "version")?[0];
-        if version != VERSION {
-            return Err(BucketedDeserializeError::UnsupportedVersion {
-                version,
-                expected: VERSION,
-            });
-        }
-
-        // Rebuild the hasher from the caller's seed and reject a wrong seed.
-        let expected_probe = take_u64(bytes, &mut pos, "hasher_probe")?;
-        let hasher = RandomState::with_seeds(seed, seed, seed, seed);
-        let actual_probe = hasher.hash_one(SERIALIZE_HASHER_PROBE);
-        if actual_probe != expected_probe {
-            return Err(BucketedDeserializeError::HasherMismatch {
-                expected: expected_probe,
-                actual: actual_probe,
-            });
-        }
-
-        let width = decoded_usize(take_u64(bytes, &mut pos, "width")?, "width")?;
-        let depth = decoded_usize(take_u64(bytes, &mut pos, "depth")?, "depth")?;
-        let decay = f64::from_bits(take_u64(bytes, &mut pos, "decay")?);
-        let top_items = decoded_usize(take_u64(bytes, &mut pos, "top_items")?, "top_items")?;
+        let width = reader.take_usize("width")?;
+        let depth = reader.take_usize("depth")?;
+        let decay = f64::from_bits(reader.take_u64("decay")?);
+        let top_items = reader.take_usize("top_items")?;
 
         // Validate scalars before sizing anything off them.
         if width < 1 {
@@ -650,12 +616,9 @@ impl BucketedTopK<Vec<u8>> {
                 detail: format!("size overflows usize (width*depth={cell_count})"),
             }
         })?;
-        let cells = parse_cells(take(bytes, &mut pos, cell_bytes, "cells")?);
+        let cells = parse_cells(reader.take(cell_bytes, "cells")?);
 
-        let pq_len = decoded_usize(
-            take_u64(bytes, &mut pos, "priority_queue length")?,
-            "priority_queue length",
-        )?;
+        let pq_len = reader.take_usize("priority_queue length")?;
         if pq_len > top_items {
             return Err(BucketedDeserializeError::LengthMismatch {
                 field: "priority queue",
@@ -670,27 +633,17 @@ impl BucketedTopK<Vec<u8>> {
         sketch.cells = cells;
 
         for _ in 0..pq_len {
-            let key_len = decoded_usize(
-                take_u64(bytes, &mut pos, "priority_queue key length")?,
-                "priority_queue key length",
-            )?;
-            let item = take(bytes, &mut pos, key_len, "priority_queue key")?.to_vec();
-            let count = take_u64(bytes, &mut pos, "priority_queue count")?;
+            let key_len = reader.take_usize("priority_queue key length")?;
+            let item = reader.take(key_len, "priority_queue key")?.to_vec();
+            let count = reader.take_u64("priority_queue count")?;
             sketch.priority_queue.upsert(item, count);
         }
         sketch.min_pq_count = sketch.priority_queue.min_count();
 
-        let rng_state: [u8; RNG_STATE_SIZE] = take(bytes, &mut pos, RNG_STATE_SIZE, "rng_state")?
-            .try_into()
-            .expect("slice is RNG_STATE_SIZE bytes");
+        let rng_state = reader.take_array::<RNG_STATE_SIZE>("rng_state")?;
         sketch.rng = Xoshiro256PlusPlus::from_seed(rng_state);
 
-        if pos != bytes.len() {
-            return Err(BucketedDeserializeError::TrailingBytes {
-                count: bytes.len() - pos,
-            });
-        }
-
+        reader.finish()?;
         Ok(sketch)
     }
 }

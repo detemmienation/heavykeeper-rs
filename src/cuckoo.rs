@@ -849,49 +849,14 @@ impl CuckooTopK<Vec<u8>> {
     /// Reconstruct a sketch from [`to_bytes`](CuckooTopK::to_bytes) output.
     /// `seed` must match the sketch's original seed; the hasher rebuilt from it.
     pub fn from_bytes(bytes: &[u8], seed: u64) -> Result<Self, CuckooDeserializeError> {
-        let mut pos = 0;
+        let mut reader = ByteReader::new(bytes);
+        reader.read_header(VARIANT, seed)?;
 
-        // Header.
-        let magic: [u8; 4] = take(bytes, &mut pos, MAGIC.len(), "magic")?
-            .try_into()
-            .expect("slice is 4 bytes");
-        if magic != MAGIC {
-            return Err(CuckooDeserializeError::BadMagic {
-                expected: MAGIC,
-                actual: magic,
-            });
-        }
-        let variant = take(bytes, &mut pos, 1, "variant")?[0];
-        if variant != VARIANT {
-            return Err(CuckooDeserializeError::WrongVariant {
-                expected: VARIANT,
-                actual: variant,
-            });
-        }
-        let version = take(bytes, &mut pos, 1, "version")?[0];
-        if version != VERSION {
-            return Err(CuckooDeserializeError::UnsupportedVersion {
-                version,
-                expected: VERSION,
-            });
-        }
-
-        // Rebuild the hasher from the caller's seed and reject a wrong seed.
-        let expected_probe = take_u64(bytes, &mut pos, "hasher_probe")?;
-        let hasher = RandomState::with_seeds(seed, seed, seed, seed);
-        let actual_probe = hasher.hash_one(SERIALIZE_HASHER_PROBE);
-        if actual_probe != expected_probe {
-            return Err(CuckooDeserializeError::HasherMismatch {
-                expected: expected_probe,
-                actual: actual_probe,
-            });
-        }
-
-        let width = decoded_usize(take_u64(bytes, &mut pos, "width")?, "width")?;
-        let depth = decoded_usize(take_u64(bytes, &mut pos, "depth")?, "depth")?;
-        let decay = f64::from_bits(take_u64(bytes, &mut pos, "decay")?);
-        let top_items = decoded_usize(take_u64(bytes, &mut pos, "top_items")?, "top_items")?;
-        let max_kicks = decoded_usize(take_u64(bytes, &mut pos, "max_kicks")?, "max_kicks")?;
+        let width = reader.take_usize("width")?;
+        let depth = reader.take_usize("depth")?;
+        let decay = f64::from_bits(reader.take_u64("decay")?);
+        let top_items = reader.take_usize("top_items")?;
+        let max_kicks = reader.take_usize("max_kicks")?;
 
         // Validate scalars before sizing anything off them.
         if width < 1 {
@@ -936,20 +901,17 @@ impl CuckooTopK<Vec<u8>> {
                     field: "lobbies",
                     detail: format!("size overflows usize (width={width})"),
                 })?;
-        let lobbies = parse_cells(take(bytes, &mut pos, lobby_bytes, "lobbies")?);
+        let lobbies = parse_cells(reader.take(lobby_bytes, "lobbies")?);
         let heavy_bytes = expected_heavy.checked_mul(CELL_SIZE).ok_or_else(|| {
             CuckooDeserializeError::InvalidField {
                 field: "heavy",
                 detail: format!("size overflows usize (width*depth={expected_heavy})"),
             }
         })?;
-        let heavy = parse_cells(take(bytes, &mut pos, heavy_bytes, "heavy")?);
+        let heavy = parse_cells(reader.take(heavy_bytes, "heavy")?);
 
         // Priority queue: a length prefix, then variable-length entries.
-        let pq_len = decoded_usize(
-            take_u64(bytes, &mut pos, "priority_queue length")?,
-            "priority_queue length",
-        )?;
+        let pq_len = reader.take_usize("priority_queue length")?;
         if pq_len > top_items {
             return Err(CuckooDeserializeError::LengthMismatch {
                 field: "priority queue",
@@ -972,28 +934,18 @@ impl CuckooTopK<Vec<u8>> {
         sketch.heavy = heavy;
 
         for _ in 0..pq_len {
-            let key_len = decoded_usize(
-                take_u64(bytes, &mut pos, "priority_queue key length")?,
-                "priority_queue key length",
-            )?;
-            let item = take(bytes, &mut pos, key_len, "priority_queue key")?.to_vec();
-            let count = take_u64(bytes, &mut pos, "priority_queue count")?;
+            let key_len = reader.take_usize("priority_queue key length")?;
+            let item = reader.take(key_len, "priority_queue key")?.to_vec();
+            let count = reader.take_u64("priority_queue count")?;
             sketch.priority_queue.upsert(item, count);
         }
         sketch.min_pq_count = sketch.priority_queue.min_count();
 
         // Restore the RNG position.
-        let rng_state: [u8; RNG_STATE_SIZE] = take(bytes, &mut pos, RNG_STATE_SIZE, "rng_state")?
-            .try_into()
-            .expect("slice is RNG_STATE_SIZE bytes");
+        let rng_state = reader.take_array::<RNG_STATE_SIZE>("rng_state")?;
         sketch.rng = Xoshiro256PlusPlus::from_seed(rng_state);
 
-        if pos != bytes.len() {
-            return Err(CuckooDeserializeError::TrailingBytes {
-                count: bytes.len() - pos,
-            });
-        }
-
+        reader.finish()?;
         Ok(sketch)
     }
 }
