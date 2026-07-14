@@ -85,13 +85,6 @@ pub enum BucketedBuilderError {
 /// See [`DeserializeError`].
 pub type BucketedDeserializeError = DeserializeError;
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, Debug)]
-struct Cell {
-    fingerprint: u64,
-    count: u64,
-}
-
 fn precompute_decay_thresholds(decay: f64, num_entries: usize) -> Box<[u64]> {
     (0..num_entries)
         .map(|count| (decay.powf(count as f64) * u64::MAX as f64) as u64)
@@ -505,17 +498,6 @@ impl<T: Ord + Clone + Hash> BucketedTopK<T> {
         let rem_thr = tbl[r] as f64 / u64::MAX as f64;
         ((last.powf(q) * rem_thr) * u64::MAX as f64) as u64
     }
-}
-
-/// Parse a `CELL_SIZE`-aligned slice into a boxed cell array.
-fn parse_cells(slice: &[u8]) -> Box<[Cell]> {
-    slice
-        .chunks_exact(CELL_SIZE)
-        .map(|chunk| Cell {
-            fingerprint: u64::from_le_bytes(chunk[0..8].try_into().expect("8 bytes")),
-            count: u64::from_le_bytes(chunk[8..16].try_into().expect("8 bytes")),
-        })
-        .collect()
 }
 
 impl BucketedTopK<Vec<u8>> {

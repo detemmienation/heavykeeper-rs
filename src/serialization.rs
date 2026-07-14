@@ -52,6 +52,24 @@ pub(crate) const CELL_SIZE: usize = 16;
 /// Bytes in a serialized `Xoshiro256PlusPlus` state (256-bit, little-endian).
 pub(crate) const RNG_STATE_SIZE: usize = 32;
 
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub(crate) struct Cell {
+    pub(crate) fingerprint: u64,
+    pub(crate) count: u64,
+}
+
+/// Parse a `CELL_SIZE`-aligned slice into a boxed cell array.
+pub(crate) fn parse_cells(slice: &[u8]) -> Box<[Cell]> {
+    slice
+        .chunks_exact(CELL_SIZE)
+        .map(|chunk| Cell {
+            fingerprint: u64::from_le_bytes(chunk[0..8].try_into().expect("8 bytes")),
+            count: u64::from_le_bytes(chunk[8..16].try_into().expect("8 bytes")),
+        })
+        .collect()
+}
+
 /// A forward-only cursor over a serialized payload. Every read is
 /// bounds-checked and advances the cursor, so `from_bytes` never touches raw
 /// offsets and a truncated stream fails with a precise `UnexpectedEof`.
