@@ -518,7 +518,7 @@ impl TopK<Vec<u8>> {
         let cell_count = self.depth * self.width;
         let pq_len = self.priority_queue.len();
         let mut out = Vec::with_capacity(
-            MAGIC.len() + 2 + 8 * 5 + cell_count * CELL_SIZE + pq_len * 24 + RNG_STATE_SIZE,
+            MAGIC.len() + 2 + 8 * 6 + cell_count * CELL_SIZE + pq_len * 24 + RNG_STATE_SIZE,
         );
 
         out.extend_from_slice(&MAGIC);

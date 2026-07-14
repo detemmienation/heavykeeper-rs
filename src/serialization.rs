@@ -7,7 +7,7 @@ use thiserror::Error;
 #[derive(Error, Debug)]
 pub enum DeserializeError {
     #[error(
-        "Byte stream too short while reading {field}: need {needed} more byte(s), have {actual}"
+        "Byte stream too short while reading {field}: need {needed} byte(s), have {actual}"
     )]
     UnexpectedEof {
         field: &'static str,
@@ -21,7 +21,7 @@ pub enum DeserializeError {
     #[error("Payload is a different sketch variant: got tag {actual} (expected {expected})")]
     WrongVariant { expected: u8, actual: u8 },
 
-    #[error("Hasher mismatch: seed produces probe {actual} but payload holds {expected} (wrong seed passed to from_bytes)")]
+    #[error("Hasher mismatch: seed produces probe {actual} but payload holds {expected} (wrong seed, or the payload was written with a different ahash version)")]
     HasherMismatch { expected: u64, actual: u64 },
 
     #[error("Unsupported serialization version {version} (this build expects {expected})")]
