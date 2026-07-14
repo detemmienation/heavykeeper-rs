@@ -70,6 +70,14 @@ pub enum CuckooDeserializeError {
         actual: usize,
     },
 
+    #[error("Not a heavykeeper sketch: bad magic bytes {actual:02x?} (expected {expected:02x?})")]
+    BadMagic { expected: [u8; 4], actual: [u8; 4] },
+
+    #[error(
+        "Payload is a different sketch variant: got tag {actual} (expected {expected} for CuckooTopK)"
+    )]
+    WrongVariant { expected: u8, actual: u8 },
+
     #[error("Unsupported serialization version {version} (this build expects {expected})")]
     UnsupportedVersion { version: u8, expected: u8 },
 
@@ -802,6 +810,8 @@ impl<T: Ord + Clone + Hash> CuckooTopK<T> {
     }
 }
 
+const MAGIC: [u8; 4] = *b"HVYK";
+const VARIANT: u8 = 2;
 const VERSION: u8 = 1;
 const CELL_SIZE: usize = 16;
 /// Bytes in a serialized `Xoshiro256PlusPlus` state (256-bit, little-endian).
@@ -863,6 +873,8 @@ impl CuckooTopK<Vec<u8>> {
     /// Serialize the sketch to a byte stream. Layout (little-endian):
     ///
     /// ```text
+    /// magic: [u8; 4]  (b"HVYK")
+    /// variant: u8
     /// version: u8
     /// width, depth, decay(bits), top_items, max_kicks: u64 each
     /// lobbies:  width        x (fingerprint: u64, count: u64)
@@ -873,15 +885,18 @@ impl CuckooTopK<Vec<u8>> {
     /// ```
     ///
     /// The seed is not stored; the hasher is rebuilt from the seed passed to
-    /// [`from_bytes`](CuckooTopK::from_bytes). The RNG position is stored 
+    /// [`from_bytes`](CuckooTopK::from_bytes). The RNG position is stored
     /// (`rng_state`) and restored exactly.
     pub fn to_bytes(&self) -> Vec<u8> {
         let cell_count = self.lobbies.len() + self.heavy.len();
         let pq_len = self.priority_queue.len();
-        // Capacity hint: header (version + 5 u64s) + cells + pq_len u64 + pq estimate + rng.
-        let mut out =
-            Vec::with_capacity(1 + 8 * 6 + cell_count * CELL_SIZE + pq_len * 24 + RNG_STATE_SIZE);
+        // Capacity hint: header (magic + variant + version + 5 u64s) + cells + pq_len u64 + pq estimate + rng.
+        let mut out = Vec::with_capacity(
+            MAGIC.len() + 2 + 8 * 6 + cell_count * CELL_SIZE + pq_len * 24 + RNG_STATE_SIZE,
+        );
 
+        out.extend_from_slice(&MAGIC);
+        out.push(VARIANT);
         out.push(VERSION);
         out.extend_from_slice(&(self.width as u64).to_le_bytes());
         out.extend_from_slice(&(self.depth as u64).to_le_bytes());
@@ -911,6 +926,22 @@ impl CuckooTopK<Vec<u8>> {
         let mut pos = 0;
 
         // Header.
+        let magic: [u8; 4] = take(bytes, &mut pos, MAGIC.len(), "magic")?
+            .try_into()
+            .expect("slice is 4 bytes");
+        if magic != MAGIC {
+            return Err(CuckooDeserializeError::BadMagic {
+                expected: MAGIC,
+                actual: magic,
+            });
+        }
+        let variant = take(bytes, &mut pos, 1, "variant")?[0];
+        if variant != VARIANT {
+            return Err(CuckooDeserializeError::WrongVariant {
+                expected: VARIANT,
+                actual: variant,
+            });
+        }
         let version = take(bytes, &mut pos, 1, "version")?[0];
         if version != VERSION {
             return Err(CuckooDeserializeError::UnsupportedVersion {
@@ -1013,7 +1044,7 @@ impl CuckooTopK<Vec<u8>> {
         }
         sketch.min_pq_count = sketch.priority_queue.min_count();
 
-        // Restore the RNG position. 
+        // Restore the RNG position.
         let rng_state: [u8; RNG_STATE_SIZE] = take(bytes, &mut pos, RNG_STATE_SIZE, "rng_state")?
             .try_into()
             .expect("slice is RNG_STATE_SIZE bytes");
@@ -1776,7 +1807,8 @@ mod tests {
     #[test]
     fn test_deserialize_rejects_unsupported_version() {
         let mut bytes = CuckooTopK::<Vec<u8>>::with_seed(10, 64, 4, 0.9, 42).to_bytes();
-        bytes[0] = VERSION + 1;
+        // Header: magic[0..4], variant[4], version[5].
+        bytes[5] = VERSION + 1;
         let Err(err) = CuckooTopK::<Vec<u8>>::from_bytes(&bytes, 42) else {
             panic!("bad version must fail");
         };
@@ -1789,8 +1821,8 @@ mod tests {
     #[test]
     fn test_deserialize_rejects_zero_width() {
         let mut bytes = CuckooTopK::<Vec<u8>>::with_seed(10, 64, 4, 0.9, 42).to_bytes();
-        // width is the first u64 right after the 1-byte version.
-        bytes[1..9].copy_from_slice(&0u64.to_le_bytes());
+        // width is the first u64 after the header (magic[4] + variant[1] + version[1]).
+        bytes[6..14].copy_from_slice(&0u64.to_le_bytes());
         let Err(err) = CuckooTopK::<Vec<u8>>::from_bytes(&bytes, 42) else {
             panic!("zero width must fail");
         };
@@ -1833,8 +1865,8 @@ mod tests {
     fn test_serialize_appends_rng_state() {
         let empty = CuckooTopK::<Vec<u8>>::with_seed(10, 64, 4, 0.9, 42);
         let bytes = empty.to_bytes();
-        // Header (version + 5 u64s) + lobbies + heavy + pq_len + rng state.
-        let header = 1 + 8 * 5;
+        // Header (magic + variant + version + 5 u64s) + lobbies + heavy + pq_len + rng state.
+        let header = MAGIC.len() + 2 + 8 * 5;
         let cells = (64 + 64 * 4) * CELL_SIZE;
         let pq_len = 8;
         assert_eq!(bytes.len(), header + cells + pq_len + RNG_STATE_SIZE);
@@ -1857,9 +1889,8 @@ mod tests {
         original.add(b"a".as_slice(), 10);
         restored.add(b"a".as_slice(), 10);
 
-        let order = |s: &CuckooTopK<Vec<u8>>| {
-            s.list().into_iter().map(|n| n.item).collect::<Vec<_>>()
-        };
+        let order =
+            |s: &CuckooTopK<Vec<u8>>| s.list().into_iter().map(|n| n.item).collect::<Vec<_>>();
         assert_eq!(
             order(&restored),
             order(&original),

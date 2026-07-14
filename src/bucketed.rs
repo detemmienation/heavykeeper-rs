@@ -89,6 +89,14 @@ pub enum BucketedDeserializeError {
         actual: usize,
     },
 
+    #[error("Not a heavykeeper sketch: bad magic bytes {actual:02x?} (expected {expected:02x?})")]
+    BadMagic { expected: [u8; 4], actual: [u8; 4] },
+
+    #[error(
+        "Payload is a different sketch variant: got tag {actual} (expected {expected} for BucketedTopK)"
+    )]
+    WrongVariant { expected: u8, actual: u8 },
+
     #[error("Unsupported serialization version {version} (this build expects {expected})")]
     UnsupportedVersion { version: u8, expected: u8 },
 
@@ -528,6 +536,8 @@ impl<T: Ord + Clone + Hash> BucketedTopK<T> {
     }
 }
 
+const MAGIC: [u8; 4] = *b"HVYK";
+const VARIANT: u8 = 1;
 const VERSION: u8 = 1;
 const CELL_SIZE: usize = 16;
 const RNG_STATE_SIZE: usize = 32;
@@ -588,6 +598,8 @@ impl BucketedTopK<Vec<u8>> {
     /// Serialize the sketch to a byte stream. Layout (little-endian):
     ///
     /// ```text
+    /// magic: [u8; 4]  (b"HVYK")
+    /// variant: u8
     /// version: u8
     /// width, depth, decay(bits), top_items: u64 each
     /// cells:    width*depth  x (fingerprint: u64, count: u64)
@@ -602,9 +614,11 @@ impl BucketedTopK<Vec<u8>> {
     pub fn to_bytes(&self) -> Vec<u8> {
         let pq_len = self.priority_queue.len();
         let mut out = Vec::with_capacity(
-            1 + 8 * 4 + self.cells.len() * CELL_SIZE + pq_len * 24 + RNG_STATE_SIZE,
+            MAGIC.len() + 2 + 8 * 4 + self.cells.len() * CELL_SIZE + pq_len * 24 + RNG_STATE_SIZE,
         );
 
+        out.extend_from_slice(&MAGIC);
+        out.push(VARIANT);
         out.push(VERSION);
         out.extend_from_slice(&(self.width as u64).to_le_bytes());
         out.extend_from_slice(&(self.depth as u64).to_le_bytes());
@@ -634,6 +648,22 @@ impl BucketedTopK<Vec<u8>> {
     pub fn from_bytes(bytes: &[u8], seed: u64) -> Result<Self, BucketedDeserializeError> {
         let mut pos = 0;
 
+        let magic: [u8; 4] = take(bytes, &mut pos, MAGIC.len(), "magic")?
+            .try_into()
+            .expect("slice is 4 bytes");
+        if magic != MAGIC {
+            return Err(BucketedDeserializeError::BadMagic {
+                expected: MAGIC,
+                actual: magic,
+            });
+        }
+        let variant = take(bytes, &mut pos, 1, "variant")?[0];
+        if variant != VARIANT {
+            return Err(BucketedDeserializeError::WrongVariant {
+                expected: VARIANT,
+                actual: variant,
+            });
+        }
         let version = take(bytes, &mut pos, 1, "version")?[0];
         if version != VERSION {
             return Err(BucketedDeserializeError::UnsupportedVersion {
@@ -1478,7 +1508,8 @@ mod tests {
     #[test]
     fn test_deserialize_rejects_unsupported_version() {
         let mut bytes = BucketedTopK::<Vec<u8>>::with_seed(10, 64, 4, 0.9, 42).to_bytes();
-        bytes[0] = VERSION + 1;
+        // Header: magic[0..4], variant[4], version[5].
+        bytes[5] = VERSION + 1;
         let Err(err) = BucketedTopK::<Vec<u8>>::from_bytes(&bytes, 42) else {
             panic!("bad version must fail");
         };
@@ -1491,8 +1522,8 @@ mod tests {
     #[test]
     fn test_deserialize_rejects_zero_width() {
         let mut bytes = BucketedTopK::<Vec<u8>>::with_seed(10, 64, 4, 0.9, 42).to_bytes();
-        // width is the first u64 right after the 1-byte version.
-        bytes[1..9].copy_from_slice(&0u64.to_le_bytes());
+        // width is the first u64 after the header (magic[4] + variant[1] + version[1]).
+        bytes[6..14].copy_from_slice(&0u64.to_le_bytes());
         let Err(err) = BucketedTopK::<Vec<u8>>::from_bytes(&bytes, 42) else {
             panic!("zero width must fail");
         };
@@ -1535,8 +1566,8 @@ mod tests {
     fn test_serialize_appends_rng_state() {
         let empty = BucketedTopK::<Vec<u8>>::with_seed(10, 64, 4, 0.9, 42);
         let bytes = empty.to_bytes();
-        // Header (version + 4 u64s) + cells + pq_len + rng state.
-        let header = 1 + 8 * 4;
+        // Header (magic + variant + version + 4 u64s) + cells + pq_len + rng state.
+        let header = MAGIC.len() + 2 + 8 * 4;
         let cells = 64 * 4 * CELL_SIZE;
         let pq_len = 8;
         assert_eq!(bytes.len(), header + cells + pq_len + RNG_STATE_SIZE);
