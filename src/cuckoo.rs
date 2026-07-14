@@ -852,31 +852,8 @@ impl CuckooTopK<Vec<u8>> {
         let mut reader = ByteReader::new(bytes);
         reader.read_header(VARIANT, seed)?;
 
-        let width = reader.take_usize("width")?;
-        let depth = reader.take_usize("depth")?;
-        let decay = f64::from_bits(reader.take_u64("decay")?);
-        let top_items = reader.take_usize("top_items")?;
+        let (width, depth, decay, top_items) = reader.read_params()?;
         let max_kicks = reader.take_usize("max_kicks")?;
-
-        // Validate scalars before sizing anything off them.
-        if width < 1 {
-            return Err(CuckooDeserializeError::InvalidField {
-                field: "width",
-                detail: format!("must be >= 1, got {width}"),
-            });
-        }
-        if depth < 1 {
-            return Err(CuckooDeserializeError::InvalidField {
-                field: "depth",
-                detail: format!("must be >= 1, got {depth}"),
-            });
-        }
-        if !decay.is_finite() || !(0.0..=1.0).contains(&decay) {
-            return Err(CuckooDeserializeError::InvalidField {
-                field: "decay",
-                detail: format!("must be a finite value in 0.0..=1.0, got {decay}"),
-            });
-        }
         if max_kicks < 1 {
             return Err(CuckooDeserializeError::InvalidField {
                 field: "max_kicks",
@@ -893,7 +870,7 @@ impl CuckooTopK<Vec<u8>> {
                 })?;
 
         // Cells: `take` checks the bytes exist before `parse_cells` allocates,
-        // so a corrupt geometry can't force a huge allocation.
+        // so a corrupt params can't force a huge allocation.
         let lobby_bytes =
             width
                 .checked_mul(CELL_SIZE)

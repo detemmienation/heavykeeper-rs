@@ -576,33 +576,10 @@ impl BucketedTopK<Vec<u8>> {
         let mut reader = ByteReader::new(bytes);
         reader.read_header(VARIANT, seed)?;
 
-        let width = reader.take_usize("width")?;
-        let depth = reader.take_usize("depth")?;
-        let decay = f64::from_bits(reader.take_u64("decay")?);
-        let top_items = reader.take_usize("top_items")?;
-
-        // Validate scalars before sizing anything off them.
-        if width < 1 {
-            return Err(BucketedDeserializeError::InvalidField {
-                field: "width",
-                detail: format!("must be >= 1, got {width}"),
-            });
-        }
-        if depth < 1 {
-            return Err(BucketedDeserializeError::InvalidField {
-                field: "depth",
-                detail: format!("must be >= 1, got {depth}"),
-            });
-        }
-        if !decay.is_finite() || !(0.0..=1.0).contains(&decay) {
-            return Err(BucketedDeserializeError::InvalidField {
-                field: "decay",
-                detail: format!("must be a finite value in 0.0..=1.0, got {decay}"),
-            });
-        }
+        let (width, depth, decay, top_items) = reader.read_params()?;
 
         // `take` checks the bytes exist before `parse_cells` allocates, so a
-        // corrupt geometry can't force a huge allocation.
+        // corrupt params can't force a huge allocation.
         let cell_count =
             width
                 .checked_mul(depth)

@@ -143,6 +143,35 @@ impl<'a> ByteReader<'a> {
         Ok(())
     }
 
+    /// Read and validate the params shared by every variant
+    pub(crate) fn read_params(&mut self) -> Result<(usize, usize, f64, usize), DeserializeError> {
+        let width = self.take_usize("width")?;
+        let depth = self.take_usize("depth")?;
+        let decay = f64::from_bits(self.take_u64("decay")?);
+        let top_items = self.take_usize("top_items")?;
+
+        if width < 1 {
+            return Err(DeserializeError::InvalidField {
+                field: "width",
+                detail: format!("must be >= 1, got {width}"),
+            });
+        }
+        if depth < 1 {
+            return Err(DeserializeError::InvalidField {
+                field: "depth",
+                detail: format!("must be >= 1, got {depth}"),
+            });
+        }
+        if !decay.is_finite() || !(0.0..=1.0).contains(&decay) {
+            return Err(DeserializeError::InvalidField {
+                field: "decay",
+                detail: format!("must be a finite value in 0.0..=1.0, got {decay}"),
+            });
+        }
+
+        Ok((width, depth, decay, top_items))
+    }
+
     /// Reject any bytes left after the payload.
     pub(crate) fn finish(&self) -> Result<(), DeserializeError> {
         if self.pos != self.bytes.len() {
