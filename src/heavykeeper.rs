@@ -87,6 +87,9 @@ pub enum TopKDeserializeError {
     )]
     WrongVariant { expected: u8, actual: u8 },
 
+    #[error("Hasher mismatch: seed produces probe {actual} but payload holds {expected} (wrong seed passed to from_bytes)")]
+    HasherMismatch { expected: u64, actual: u64 },
+
     #[error("Unsupported serialization version {version} (this build expects {expected})")]
     UnsupportedVersion { version: u8, expected: u8 },
 
@@ -515,6 +518,9 @@ const VERSION: u8 = 1;
 const CELL_SIZE: usize = 16;
 const RNG_STATE_SIZE: usize = 32;
 
+/// Probe hashed at serialize time to detect a wrong seed on load.
+const SERIALIZE_HASHER_PROBE: &[u8] = b"heavykeeper-serialize-hasher-probe";
+
 /// Narrow a `u64` to `usize`, erroring on overflow.
 fn decoded_usize(value: u64, field: &'static str) -> Result<usize, TopKDeserializeError> {
     usize::try_from(value).map_err(|_| TopKDeserializeError::InvalidField {
@@ -578,6 +584,7 @@ impl TopK<Vec<u8>> {
     /// magic: [u8; 4]  (b"HVYK")
     /// variant: u8
     /// version: u8
+    /// hasher_probe: u64  (SERIALIZE_HASHER_PROBE hashed with the sketch's hasher)
     /// width, depth, decay(bits), top_items: u64 each
     /// buckets:  depth  x  width  x (fingerprint: u64, count: u64)
     /// pq_len: u64
@@ -586,18 +593,20 @@ impl TopK<Vec<u8>> {
     /// ```
     ///
     /// The seed is not stored; the hasher is rebuilt from the seed passed to
-    /// [`from_bytes`](TopK::from_bytes). The RNG position is stored
-    /// (`rng_state`) and restored exactly.
+    /// [`from_bytes`](TopK::from_bytes). A `hasher_probe` guards against a wrong
+    /// seed: it is the hash of a fixed value, re-checked on load. The RNG
+    /// position is stored (`rng_state`) and restored exactly.
     pub fn to_bytes(&self) -> Vec<u8> {
         let cell_count = self.depth * self.width;
         let pq_len = self.priority_queue.len();
         let mut out = Vec::with_capacity(
-            MAGIC.len() + 2 + 8 * 4 + cell_count * CELL_SIZE + pq_len * 24 + RNG_STATE_SIZE,
+            MAGIC.len() + 2 + 8 * 5 + cell_count * CELL_SIZE + pq_len * 24 + RNG_STATE_SIZE,
         );
 
         out.extend_from_slice(&MAGIC);
         out.push(VARIANT);
         out.push(VERSION);
+        out.extend_from_slice(&self.hasher.hash_one(SERIALIZE_HASHER_PROBE).to_le_bytes());
         out.extend_from_slice(&(self.width as u64).to_le_bytes());
         out.extend_from_slice(&(self.depth as u64).to_le_bytes());
         out.extend_from_slice(&self.decay.to_bits().to_le_bytes());
@@ -649,6 +658,18 @@ impl TopK<Vec<u8>> {
                 expected: VERSION,
             });
         }
+
+        // Rebuild the hasher from the caller's seed and reject a wrong seed.
+        let expected_probe = take_u64(bytes, &mut pos, "hasher_probe")?;
+        let hasher = RandomState::with_seeds(seed, seed, seed, seed);
+        let actual_probe = hasher.hash_one(SERIALIZE_HASHER_PROBE);
+        if actual_probe != expected_probe {
+            return Err(TopKDeserializeError::HasherMismatch {
+                expected: expected_probe,
+                actual: actual_probe,
+            });
+        }
+
         let width = decoded_usize(take_u64(bytes, &mut pos, "width")?, "width")?;
         let depth = decoded_usize(take_u64(bytes, &mut pos, "depth")?, "depth")?;
         let decay = f64::from_bits(take_u64(bytes, &mut pos, "decay")?);
@@ -1917,8 +1938,8 @@ mod tests {
     #[test]
     fn test_deserialize_rejects_zero_width() {
         let mut bytes = TopK::<Vec<u8>>::with_seed(10, 64, 4, 0.9, 42).to_bytes();
-        // width is the first u64 after the header (magic[4] + variant[1] + version[1]).
-        bytes[6..14].copy_from_slice(&0u64.to_le_bytes());
+        // width is the first u64 after the header (magic[4] + variant[1] + version[1] + probe[8]).
+        bytes[14..22].copy_from_slice(&0u64.to_le_bytes());
         let Err(err) = TopK::<Vec<u8>>::from_bytes(&bytes, 42) else {
             panic!("zero width must fail");
         };
@@ -1961,8 +1982,8 @@ mod tests {
     fn test_serialize_appends_rng_state() {
         let empty = TopK::<Vec<u8>>::with_seed(10, 64, 4, 0.9, 42);
         let bytes = empty.to_bytes();
-        // Header (magic + variant + version + 4 u64s) + buckets + pq_len + rng state.
-        let header = MAGIC.len() + 2 + 8 * 4;
+        // Header (magic + variant + version + probe + 4 u64s) + buckets + pq_len + rng state.
+        let header = MAGIC.len() + 2 + 8 * 5;
         let cells = 64 * 4 * CELL_SIZE;
         let pq_len = 8;
         assert_eq!(bytes.len(), header + cells + pq_len + RNG_STATE_SIZE);
