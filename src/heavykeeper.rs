@@ -1745,56 +1745,15 @@ mod tests {
         assert!(restored.list().is_empty());
     }
 
+    // Error paths are covered by the `ByteReader` tests in `serialization.rs`.
+    // This pins the wiring: another variant's payload must be rejected.
     #[test]
-    fn test_deserialize_rejects_truncated_stream() {
-        let mut sketch = TopK::<Vec<u8>>::with_seed(10, 64, 4, 0.9, 42);
-        sketch.add(b"foo".as_slice(), 5);
-        let bytes = sketch.to_bytes();
-        let Err(err) = TopK::<Vec<u8>>::from_bytes(&bytes[..bytes.len() - 1], 42) else {
-            panic!("truncated stream must fail");
+    fn test_deserialize_rejects_other_variant() {
+        let other = crate::BucketedTopK::<Vec<u8>>::with_seed(10, 64, 4, 0.9, 42).to_bytes();
+        let Err(err) = TopK::<Vec<u8>>::from_bytes(&other, 42) else {
+            panic!("another variant's payload must fail");
         };
-        assert!(matches!(err, TopKDeserializeError::UnexpectedEof { .. }));
-    }
-
-    #[test]
-    fn test_deserialize_rejects_trailing_bytes() {
-        let mut bytes = TopK::<Vec<u8>>::with_seed(10, 64, 4, 0.9, 42).to_bytes();
-        bytes.push(0xff);
-        let Err(err) = TopK::<Vec<u8>>::from_bytes(&bytes, 42) else {
-            panic!("trailing bytes must fail");
-        };
-        assert!(matches!(
-            err,
-            TopKDeserializeError::TrailingBytes { count: 1 }
-        ));
-    }
-
-    #[test]
-    fn test_deserialize_rejects_unsupported_version() {
-        let mut bytes = TopK::<Vec<u8>>::with_seed(10, 64, 4, 0.9, 42).to_bytes();
-        // Header: magic[0..4], variant[4], version[5].
-        bytes[5] = VERSION + 1;
-        let Err(err) = TopK::<Vec<u8>>::from_bytes(&bytes, 42) else {
-            panic!("bad version must fail");
-        };
-        assert!(matches!(
-            err,
-            TopKDeserializeError::UnsupportedVersion { .. }
-        ));
-    }
-
-    #[test]
-    fn test_deserialize_rejects_zero_width() {
-        let mut bytes = TopK::<Vec<u8>>::with_seed(10, 64, 4, 0.9, 42).to_bytes();
-        // width is the first u64 after the header (magic[4] + variant[1] + version[1] + probe[8]).
-        bytes[14..22].copy_from_slice(&0u64.to_le_bytes());
-        let Err(err) = TopK::<Vec<u8>>::from_bytes(&bytes, 42) else {
-            panic!("zero width must fail");
-        };
-        assert!(matches!(
-            err,
-            TopKDeserializeError::InvalidField { field: "width", .. }
-        ));
+        assert!(matches!(err, TopKDeserializeError::WrongVariant { .. }));
     }
 
     /// Regression: a restored sketch must resume the RNG where the original

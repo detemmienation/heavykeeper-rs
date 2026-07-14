@@ -66,7 +66,11 @@ impl<'a> ByteReader<'a> {
     }
 
     /// Read `n` bytes, advancing the cursor.
-    pub(crate) fn take(&mut self, n: usize, field: &'static str) -> Result<&'a [u8], DeserializeError> {
+    pub(crate) fn take(
+        &mut self,
+        n: usize,
+        field: &'static str,
+    ) -> Result<&'a [u8], DeserializeError> {
         let available = self.bytes.len().saturating_sub(self.pos);
         if available < n {
             return Err(DeserializeError::UnexpectedEof {
@@ -109,7 +113,7 @@ impl<'a> ByteReader<'a> {
 
     /// Verify the fixed header shared by every variant: magic, `variant` tag,
     /// version, and the hasher probe. Rebuilds the hasher from `seed` and
-    /// rejects a wrong seed before any geometry is parsed.
+    /// rejects a wrong seed before any params are parsed.
     pub(crate) fn read_header(&mut self, variant: u8, seed: u64) -> Result<(), DeserializeError> {
         let magic = self.take_array::<4>("magic")?;
         if magic != MAGIC {
@@ -133,7 +137,8 @@ impl<'a> ByteReader<'a> {
             });
         }
         let expected_probe = self.take_u64("hasher_probe")?;
-        let actual_probe = RandomState::with_seeds(seed, seed, seed, seed).hash_one(SERIALIZE_HASHER_PROBE);
+        let actual_probe =
+            RandomState::with_seeds(seed, seed, seed, seed).hash_one(SERIALIZE_HASHER_PROBE);
         if actual_probe != expected_probe {
             return Err(DeserializeError::HasherMismatch {
                 expected: expected_probe,
@@ -180,5 +185,127 @@ impl<'a> ByteReader<'a> {
             });
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SEED: u64 = 42;
+    const VARIANT: u8 = 0;
+
+    /// Build a valid header (magic, variant, version, probe) for `SEED`.
+    fn header(variant: u8) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&MAGIC);
+        out.push(variant);
+        out.push(VERSION);
+        let probe =
+            RandomState::with_seeds(SEED, SEED, SEED, SEED).hash_one(SERIALIZE_HASHER_PROBE);
+        out.extend_from_slice(&probe.to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn read_header_rejects_bad_magic() {
+        let mut bytes = header(VARIANT);
+        bytes[0] ^= 0xff;
+        let mut r = ByteReader::new(&bytes);
+        assert!(matches!(
+            r.read_header(VARIANT, SEED),
+            Err(DeserializeError::BadMagic { .. })
+        ));
+    }
+
+    #[test]
+    fn read_header_rejects_wrong_variant() {
+        let bytes = header(VARIANT + 1);
+        let mut r = ByteReader::new(&bytes);
+        assert!(matches!(
+            r.read_header(VARIANT, SEED),
+            Err(DeserializeError::WrongVariant { .. })
+        ));
+    }
+
+    #[test]
+    fn read_header_rejects_unsupported_version() {
+        let mut bytes = header(VARIANT);
+        bytes[5] = VERSION + 1;
+        let mut r = ByteReader::new(&bytes);
+        assert!(matches!(
+            r.read_header(VARIANT, SEED),
+            Err(DeserializeError::UnsupportedVersion { .. })
+        ));
+    }
+
+    #[test]
+    fn read_header_rejects_wrong_seed() {
+        let bytes = header(VARIANT);
+        let mut r = ByteReader::new(&bytes);
+        assert!(matches!(
+            r.read_header(VARIANT, SEED + 1),
+            Err(DeserializeError::HasherMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn read_header_rejects_truncated() {
+        let bytes = header(VARIANT);
+        let mut r = ByteReader::new(&bytes[..bytes.len() - 1]);
+        assert!(matches!(
+            r.read_header(VARIANT, SEED),
+            Err(DeserializeError::UnexpectedEof { .. })
+        ));
+    }
+
+    #[test]
+    fn read_params_validates_scalars() {
+        // width, depth, decay, top_items
+        let mut ok = Vec::new();
+        ok.extend_from_slice(&8u64.to_le_bytes());
+        ok.extend_from_slice(&4u64.to_le_bytes());
+        ok.extend_from_slice(&0.9f64.to_bits().to_le_bytes());
+        ok.extend_from_slice(&10u64.to_le_bytes());
+        let mut r = ByteReader::new(&ok);
+        assert_eq!(r.read_params().unwrap(), (8, 4, 0.9, 10));
+
+        // width = 0 is rejected.
+        let mut bad = ok.clone();
+        bad[0..8].copy_from_slice(&0u64.to_le_bytes());
+        let mut r = ByteReader::new(&bad);
+        assert!(matches!(
+            r.read_params(),
+            Err(DeserializeError::InvalidField { field: "width", .. })
+        ));
+
+        // depth = 0 is rejected.
+        let mut bad = ok.clone();
+        bad[8..16].copy_from_slice(&0u64.to_le_bytes());
+        let mut r = ByteReader::new(&bad);
+        assert!(matches!(
+            r.read_params(),
+            Err(DeserializeError::InvalidField { field: "depth", .. })
+        ));
+
+        // out-of-range decay is rejected.
+        let mut bad = ok.clone();
+        bad[16..24].copy_from_slice(&2.0f64.to_bits().to_le_bytes());
+        let mut r = ByteReader::new(&bad);
+        assert!(matches!(
+            r.read_params(),
+            Err(DeserializeError::InvalidField { field: "decay", .. })
+        ));
+    }
+
+    #[test]
+    fn finish_rejects_trailing_bytes() {
+        let bytes = [0u8; 2];
+        let mut r = ByteReader::new(&bytes);
+        r.take(1, "x").unwrap();
+        assert!(matches!(
+            r.finish(),
+            Err(DeserializeError::TrailingBytes { count: 1 })
+        ));
     }
 }
