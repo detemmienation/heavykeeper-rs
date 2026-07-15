@@ -2,10 +2,7 @@ use crate::hash_composition::HashComposer;
 use crate::priority_queue::TopKQueue;
 use crate::serialization::*;
 use ahash::RandomState;
-// Import RNG traits from `rand_xoshiro`'s re-exported `rand_core` (0.10, not the
-// 0.9 `rand` uses); in 0.10 `next_u64` is on `Rng`, not `RngCore`.
-use rand_xoshiro::rand_core::{Rng, SeedableRng};
-use rand_xoshiro::Xoshiro256PlusPlus;
+use fastrand::Rng;
 use std::borrow::Borrow;
 use std::clone::Clone;
 use std::fmt::Debug;
@@ -88,7 +85,7 @@ pub struct TopK<T: Ord + Clone + Hash> {
     buckets: Vec<Vec<Bucket>>,
     priority_queue: TopKQueue<T>,
     hasher: RandomState,
-    random: Xoshiro256PlusPlus,
+    random: Rng,
 }
 
 pub struct Builder<T> {
@@ -132,7 +129,7 @@ impl<T: Ord + Clone + Hash> TopK<T> {
             depth,
             decay,
             hasher,
-            Xoshiro256PlusPlus::seed_from_u64(seed),
+            Rng::with_seed(seed),
         )
     }
 
@@ -149,7 +146,7 @@ impl<T: Ord + Clone + Hash> TopK<T> {
             depth,
             decay,
             hasher,
-            Xoshiro256PlusPlus::seed_from_u64(0),
+            Rng::with_seed(0),
         )
     }
 
@@ -159,7 +156,7 @@ impl<T: Ord + Clone + Hash> TopK<T> {
         depth: usize,
         decay: f64,
         hasher: RandomState,
-        rng: Xoshiro256PlusPlus,
+        rng: Rng,
     ) -> Self {
         // Pre-allocate with capacity to avoid resizing
         let mut buckets = Vec::with_capacity(depth);
@@ -333,7 +330,7 @@ impl<T: Ord + Clone + Hash> TopK<T> {
                 while remaining_incr > 0 {
                     let current_count = self.buckets[i][bucket_idx].count;
                     let decay_threshold = self.decay_threshold(current_count);
-                    let rand = self.random.next_u64();
+                    let rand = self.random.u64(..);
                     let bucket = &mut self.buckets[i][bucket_idx];
                     if rand < decay_threshold {
                         bucket.count = bucket.count.saturating_sub(1);
@@ -543,7 +540,7 @@ impl TopK<Vec<u8>> {
             out.extend_from_slice(item);
             out.extend_from_slice(&count.to_le_bytes());
         }
-        out.extend_from_slice(&self.random.state());
+        out.extend_from_slice(&self.random.get_seed().to_le_bytes());
 
         out
     }
@@ -594,8 +591,7 @@ impl TopK<Vec<u8>> {
             sketch.priority_queue.upsert(item, count);
         }
 
-        let rng_state = reader.take_array::<RNG_STATE_SIZE>("rng_state")?;
-        sketch.random = Xoshiro256PlusPlus::from_seed(rng_state);
+        sketch.random = Rng::with_seed(reader.take_u64("rng_state")?);
 
         reader.finish()?;
         Ok(sketch)
@@ -716,7 +712,7 @@ impl<T: Ord + Clone + Hash> Builder<T> {
             }
         });
 
-        let rng = Xoshiro256PlusPlus::seed_from_u64(self.seed.unwrap_or(0));
+        let rng = Rng::with_seed(self.seed.unwrap_or(0));
 
         Ok(TopK::with_components(k, width, depth, decay, hasher, rng))
     }
@@ -1635,7 +1631,7 @@ mod tests {
 
     /// Tests that decay probability scaling uses the full u64 range
     ///
-    /// The decay roll is `rng.next_u64() < threshold`. With decay = 1.0 the
+    /// The decay roll is `rng.u64(..) < threshold`. With decay = 1.0 the
     /// threshold must span the full u64 range (`u64::MAX`) so that decay
     /// fires for every possible RNG value.
     #[test]

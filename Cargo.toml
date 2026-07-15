@@ -21,7 +21,7 @@ path = "src/lib.rs"
 
 
 [dependencies]
-rand_xoshiro = "0.8"
+fastrand = "2"
 ahash = "0.8.11"
 thiserror = "2.0.11"
 

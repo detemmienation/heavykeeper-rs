@@ -12,10 +12,7 @@ use std::fmt::Debug;
 use std::hash::Hash;
 
 use ahash::RandomState;
-// Import RNG traits from `rand_xoshiro`'s re-exported `rand_core` (0.10, not the
-// 0.9 `rand` uses); in 0.10 `next_u64` is on `Rng`, not `RngCore`.
-use rand_xoshiro::rand_core::{Rng, SeedableRng};
-use rand_xoshiro::Xoshiro256PlusPlus;
+use fastrand::Rng;
 use thiserror::Error;
 
 use crate::priority_queue::TopKQueue;
@@ -134,7 +131,7 @@ pub struct CuckooTopK<T: Ord + Clone + Hash> {
     decay_thresholds: Box<[u64]>,
     priority_queue: TopKQueue<T>,
     hasher: RandomState,
-    rng: Xoshiro256PlusPlus,
+    rng: Rng,
     min_pq_count: u64,
     top_items: usize,
     max_kicks: usize,
@@ -161,7 +158,7 @@ impl<T: Ord + Clone + Hash> CuckooTopK<T> {
             depth,
             decay,
             hasher,
-            Xoshiro256PlusPlus::seed_from_u64(seed),
+            Rng::with_seed(seed),
             DEFAULT_MAX_CUCKOO_KICKS,
         )
     }
@@ -183,7 +180,7 @@ impl<T: Ord + Clone + Hash> CuckooTopK<T> {
             depth,
             decay,
             hasher,
-            Xoshiro256PlusPlus::seed_from_u64(0),
+            Rng::with_seed(0),
             DEFAULT_MAX_CUCKOO_KICKS,
         )
     }
@@ -199,7 +196,7 @@ impl<T: Ord + Clone + Hash> CuckooTopK<T> {
         depth: usize,
         decay: f64,
         hasher: RandomState,
-        rng: Xoshiro256PlusPlus,
+        rng: Rng,
         max_kicks: usize,
     ) -> Self {
         let width_mask = if width > 1 && width.is_power_of_two() {
@@ -718,7 +715,7 @@ impl<T: Ord + Clone + Hash> CuckooTopK<T> {
         while remaining > 0 {
             let current_count = self.lobbies[bucket].count;
             let threshold = self.decay_threshold(current_count);
-            if self.rng.next_u64() < threshold {
+            if self.rng.u64(..) < threshold {
                 let lobby = &mut self.lobbies[bucket];
                 lobby.count = lobby.count.saturating_sub(1);
                 if lobby.count == 0 {
@@ -823,7 +820,7 @@ impl CuckooTopK<Vec<u8>> {
             out.extend_from_slice(item);
             out.extend_from_slice(&count.to_le_bytes());
         }
-        out.extend_from_slice(&self.rng.state());
+        out.extend_from_slice(&self.rng.get_seed().to_le_bytes());
 
         out
     }
@@ -901,8 +898,7 @@ impl CuckooTopK<Vec<u8>> {
         sketch.min_pq_count = sketch.priority_queue.min_count();
 
         // Restore the RNG position.
-        let rng_state = reader.take_array::<RNG_STATE_SIZE>("rng_state")?;
-        sketch.rng = Xoshiro256PlusPlus::from_seed(rng_state);
+        sketch.rng = Rng::with_seed(reader.take_u64("rng_state")?);
 
         reader.finish()?;
         Ok(sketch)
@@ -1003,7 +999,7 @@ impl<T: Ord + Clone + Hash> CuckooBuilder<T> {
                 RandomState::new()
             }
         });
-        let rng = Xoshiro256PlusPlus::seed_from_u64(self.seed.unwrap_or(0));
+        let rng = Rng::with_seed(self.seed.unwrap_or(0));
         Ok(CuckooTopK::with_components(
             k, width, depth, decay, hasher, rng, max_kicks,
         ))

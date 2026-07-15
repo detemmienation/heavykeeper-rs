@@ -46,11 +46,15 @@ pub(crate) const MAGIC: [u8; 4] = *b"HVYK";
 /// On-disk format version. Bump whenever the byte layout changes.
 pub(crate) const VERSION: u8 = 1;
 /// Probe hashed at serialize time to detect a wrong seed on load.
+///
+/// `ahash` output is not stable across CPU architectures or `ahash` versions,
+/// so a payload only loads on the same architecture and `ahash` version that
+/// wrote it; otherwise the probe mismatches and load fails with `HasherMismatch`.
 pub(crate) const SERIALIZE_HASHER_PROBE: &[u8] = b"heavykeeper-serialize-hasher-probe";
 /// Bytes per serialized cell: `(fingerprint: u64, count: u64)`.
 pub(crate) const CELL_SIZE: usize = 16;
-/// Bytes in a serialized `Xoshiro256PlusPlus` state (256-bit, little-endian).
-pub(crate) const RNG_STATE_SIZE: usize = 32;
+/// Bytes in a serialized `fastrand::Rng` state (its 64-bit seed, little-endian).
+pub(crate) const RNG_STATE_SIZE: usize = 8;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug)]

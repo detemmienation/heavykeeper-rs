@@ -7,10 +7,7 @@ use std::fmt::Debug;
 use std::hash::Hash;
 
 use ahash::RandomState;
-// Import RNG traits from `rand_xoshiro`'s re-exported `rand_core` (0.10, not the
-// 0.9 `rand` uses); in 0.10 `next_u64` is on `Rng`, not `RngCore`.
-use rand_xoshiro::rand_core::{Rng, SeedableRng};
-use rand_xoshiro::Xoshiro256PlusPlus;
+use fastrand::Rng;
 use thiserror::Error;
 
 use crate::priority_queue::TopKQueue;
@@ -104,7 +101,7 @@ pub struct BucketedTopK<T: Ord + Clone + Hash> {
     decay_thresholds: Box<[u64]>,
     priority_queue: TopKQueue<T>,
     hasher: RandomState,
-    rng: Xoshiro256PlusPlus,
+    rng: Rng,
     min_pq_count: u64,
     top_items: usize,
 }
@@ -133,7 +130,7 @@ impl<T: Ord + Clone + Hash> BucketedTopK<T> {
             depth,
             decay,
             hasher,
-            Xoshiro256PlusPlus::seed_from_u64(0),
+            Rng::with_seed(0),
         )
     }
 
@@ -147,7 +144,7 @@ impl<T: Ord + Clone + Hash> BucketedTopK<T> {
         depth: usize,
         decay: f64,
         hasher: RandomState,
-        rng: Xoshiro256PlusPlus,
+        rng: Rng,
     ) -> Self {
         let priority_queue = TopKQueue::with_capacity_and_hasher(k, hasher.clone());
         let width_mask = if width > 1 && width.is_power_of_two() {
@@ -470,7 +467,7 @@ impl<T: Ord + Clone + Hash> BucketedTopK<T> {
         while remaining > 0 {
             let current_count = self.cells[cell_idx].count;
             let threshold = self.decay_threshold(current_count);
-            if self.rng.next_u64() < threshold {
+            if self.rng.u64(..) < threshold {
                 let cell = &mut self.cells[cell_idx];
                 cell.count = cell.count.saturating_sub(1);
                 if cell.count == 0 {
@@ -547,7 +544,7 @@ impl BucketedTopK<Vec<u8>> {
             out.extend_from_slice(item);
             out.extend_from_slice(&count.to_le_bytes());
         }
-        out.extend_from_slice(&self.rng.state());
+        out.extend_from_slice(&self.rng.get_seed().to_le_bytes());
 
         out
     }
@@ -599,8 +596,7 @@ impl BucketedTopK<Vec<u8>> {
         }
         sketch.min_pq_count = sketch.priority_queue.min_count();
 
-        let rng_state = reader.take_array::<RNG_STATE_SIZE>("rng_state")?;
-        sketch.rng = Xoshiro256PlusPlus::from_seed(rng_state);
+        sketch.rng = Rng::with_seed(reader.take_u64("rng_state")?);
 
         reader.finish()?;
         Ok(sketch)
@@ -706,7 +702,7 @@ impl<T: Ord + Clone + Hash> BucketedBuilder<T> {
                 RandomState::new()
             }
         });
-        let rng = Xoshiro256PlusPlus::seed_from_u64(self.seed.unwrap_or(0));
+        let rng = Rng::with_seed(self.seed.unwrap_or(0));
         Ok(BucketedTopK::with_components(
             k, width, depth, decay, hasher, rng,
         ))
