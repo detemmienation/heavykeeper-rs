@@ -19,3 +19,6 @@ pub use cuckoo::{
 
 mod hash_composition;
 mod priority_queue;
+
+mod serialization;
+pub use serialization::DeserializeError;
