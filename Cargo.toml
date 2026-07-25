@@ -21,7 +21,7 @@ path = "src/lib.rs"
 
 
 [features]
-default = []
+default = ["narrow-cells"]
 # Store cell fingerprint and count as u32 instead of u64 (8 bytes/cell vs 16),
 # halving the bucket-array footprint. Changes the serialized byte layout.
 narrow-cells = []
