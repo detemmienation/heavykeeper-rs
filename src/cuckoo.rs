@@ -20,6 +20,55 @@ use crate::serialization::*;
 
 const DECAY_LOOKUP_SIZE: usize = 1024;
 
+/// Number of precomputed decay thresholds to store, selected at compile time:
+///
+/// - default: the full [`DECAY_LOOKUP_SIZE`] table (8 KiB).
+/// - `short-decay-table`: the smallest table that still covers the meaningful
+///   decay range — `ceil(-64*ln2 / ln(decay))` entries, the count at which
+///   `decay^count` drops below `2^-64` (rounds to a zero threshold). Beyond it
+///   `decay_threshold` extrapolates to ~0, same as the full table would.
+/// - `no-decay-table`: zero entries; `decay_threshold` computes `decay^count`
+///   on the fly (no table memory, ~1.5x per-decay cost).
+#[cfg(not(any(feature = "short-decay-table", feature = "no-decay-table")))]
+fn decay_table_len(_decay: f64) -> usize {
+    DECAY_LOOKUP_SIZE
+}
+
+#[cfg(all(feature = "short-decay-table", not(feature = "no-decay-table")))]
+fn decay_table_len(decay: f64) -> usize {
+    if !(0.0..1.0).contains(&decay) || decay <= 0.0 {
+        return DECAY_LOOKUP_SIZE;
+    }
+    let n = (-64.0 * std::f64::consts::LN_2 / decay.ln()).ceil();
+    (n as usize).clamp(1, DECAY_LOOKUP_SIZE)
+}
+
+#[cfg(feature = "no-decay-table")]
+fn decay_table_len(_decay: f64) -> usize {
+    0
+}
+
+/// Narrow a full-width count into the stored counter type, saturating at
+/// `Cnt::MAX`. A no-op widening pass-through when `Cnt == u64`.
+#[inline]
+fn narrow_count(v: u64) -> Cnt {
+    if v > Cnt::MAX as u64 {
+        Cnt::MAX
+    } else {
+        v as Cnt
+    }
+}
+
+/// Narrow a full-width hash into the stored fingerprint type. Truncation is
+/// intentional: the same narrow fingerprint is used for *both* candidate-bucket
+/// derivation (widened back via `as u64`) and heavy-slot identity, so cuckoo
+/// relocation — which recomputes buckets from the stored fingerprint — stays
+/// consistent. A no-op when `Fp == u64`.
+#[inline]
+fn narrow_fp(h: u64) -> Fp {
+    h as Fp
+}
+
 /// Variant tag for `CuckooTopK` in the serialized header.
 const VARIANT: u8 = 2;
 
@@ -229,7 +278,7 @@ impl<T: Ord + Clone + Hash> CuckooTopK<T> {
             decay,
             lobbies: vec![Cell::default(); width].into_boxed_slice(),
             heavy: vec![Cell::default(); width * depth].into_boxed_slice(),
-            decay_thresholds: precompute_decay_thresholds(decay, DECAY_LOOKUP_SIZE),
+            decay_thresholds: precompute_decay_thresholds(decay, decay_table_len(decay)),
             priority_queue: TopKQueue::with_capacity_and_hasher(k, hasher.clone()),
             hasher,
             rng,
@@ -268,12 +317,13 @@ impl<T: Ord + Clone + Hash> CuckooTopK<T> {
             return (None, false);
         }
 
-        let fp = self.hasher.hash_one(item);
-        let (primary, alternate) = self.bucket_pair(fp);
+        let fp = narrow_fp(self.hasher.hash_one(item));
+        let (primary, alternate) = self.bucket_pair(fp as u64);
 
         if let Some(idx) = self.find_heavy(fp, primary, alternate) {
-            self.heavy[idx].count = self.heavy[idx].count.saturating_add(increment);
-            return self.update_priority_queue(item, self.heavy[idx].count);
+            let updated = (self.heavy[idx].count as u64).saturating_add(increment);
+            self.heavy[idx].count = narrow_count(updated);
+            return self.update_priority_queue(item, self.heavy[idx].count as u64);
         }
 
         let lobby_count = match self.update_lobby(primary, fp, increment) {
@@ -314,14 +364,14 @@ impl<T: Ord + Clone + Hash> CuckooTopK<T> {
         T: Borrow<Q>,
         Q: Hash + Eq + ToOwned<Owned = T> + ?Sized,
     {
-        let fp = self.hasher.hash_one(item);
-        let (primary, alternate) = self.bucket_pair(fp);
+        let fp = narrow_fp(self.hasher.hash_one(item));
+        let (primary, alternate) = self.bucket_pair(fp as u64);
         if let Some(idx) = self.find_heavy(fp, primary, alternate) {
-            return self.heavy[idx].count;
+            return self.heavy[idx].count as u64;
         }
         let lobby = self.lobbies[primary];
         if lobby.fingerprint == fp {
-            lobby.count
+            lobby.count as u64
         } else {
             0
         }
@@ -490,23 +540,24 @@ impl<T: Ord + Clone + Hash> CuckooTopK<T> {
                 continue;
             }
             let fp = oc.fingerprint;
-            let mut count = oc.count;
-            let (primary, alternate) = self.bucket_pair(fp);
+            let mut count = oc.count as u64;
+            let (primary, alternate) = self.bucket_pair(fp as u64);
 
             if self.lobbies[primary].count > 0 && self.lobbies[primary].fingerprint == fp {
-                count = count.saturating_add(self.lobbies[primary].count);
+                count = count.saturating_add(self.lobbies[primary].count as u64);
                 self.lobbies[primary] = Cell::default();
             }
 
             if let Some(idx) = self.find_heavy(fp, primary, alternate) {
-                self.heavy[idx].count = self.heavy[idx].count.saturating_add(count);
+                self.heavy[idx].count =
+                    narrow_count((self.heavy[idx].count as u64).saturating_add(count));
                 continue;
             }
 
             if let Some(idx) = self.find_empty_heavy_in_bucket(primary) {
                 self.heavy[idx] = Cell {
                     fingerprint: fp,
-                    count,
+                    count: narrow_count(count),
                 };
                 continue;
             }
@@ -514,7 +565,7 @@ impl<T: Ord + Clone + Hash> CuckooTopK<T> {
                 if let Some(idx) = self.find_empty_heavy_in_bucket(alternate) {
                     self.heavy[idx] = Cell {
                         fingerprint: fp,
-                        count,
+                        count: narrow_count(count),
                     };
                     continue;
                 }
@@ -526,7 +577,7 @@ impl<T: Ord + Clone + Hash> CuckooTopK<T> {
                 let victim = self.heavy[victim_idx];
                 self.heavy[victim_idx] = Cell {
                     fingerprint: fp,
-                    count,
+                    count: narrow_count(count),
                 };
                 self.relocate_victim(victim, victim_bucket);
             }
@@ -543,21 +594,23 @@ impl<T: Ord + Clone + Hash> CuckooTopK<T> {
                 continue;
             }
             let fp = oc.fingerprint;
-            let count = oc.count;
-            let (primary, alternate) = self.bucket_pair(fp);
+            let count = oc.count as u64;
+            let (primary, alternate) = self.bucket_pair(fp as u64);
 
             if let Some(idx) = self.find_heavy(fp, primary, alternate) {
-                self.heavy[idx].count = self.heavy[idx].count.saturating_add(count);
+                self.heavy[idx].count =
+                    narrow_count((self.heavy[idx].count as u64).saturating_add(count));
                 continue;
             }
 
             let lobby = self.lobbies[primary];
             if lobby.count > 0 && lobby.fingerprint == fp {
-                self.lobbies[primary].count = lobby.count.saturating_add(count);
-            } else if lobby.count == 0 || count > lobby.count {
+                self.lobbies[primary].count =
+                    narrow_count((lobby.count as u64).saturating_add(count));
+            } else if lobby.count == 0 || count > lobby.count as u64 {
                 self.lobbies[primary] = Cell {
                     fingerprint: fp,
-                    count,
+                    count: narrow_count(count),
                 };
             }
             // else: keep self's lobby occupant (higher count wins; ties keep
@@ -612,7 +665,7 @@ impl<T: Ord + Clone + Hash> CuckooTopK<T> {
     }
 
     #[inline]
-    fn find_heavy(&self, fingerprint: u64, primary: usize, alternate: usize) -> Option<usize> {
+    fn find_heavy(&self, fingerprint: Fp, primary: usize, alternate: usize) -> Option<usize> {
         if let Some(idx) = self.find_heavy_in_bucket(fingerprint, primary) {
             return Some(idx);
         }
@@ -624,7 +677,7 @@ impl<T: Ord + Clone + Hash> CuckooTopK<T> {
     }
 
     #[inline]
-    fn find_heavy_in_bucket(&self, fingerprint: u64, bucket: usize) -> Option<usize> {
+    fn find_heavy_in_bucket(&self, fingerprint: Fp, bucket: usize) -> Option<usize> {
         self.heavy_range(bucket)
             .find(|&idx| self.heavy[idx].count > 0 && self.heavy[idx].fingerprint == fingerprint)
     }
@@ -640,7 +693,7 @@ impl<T: Ord + Clone + Hash> CuckooTopK<T> {
         let mut min_idx = bucket * self.depth;
         let mut min_count = u64::MAX;
         for idx in self.heavy_range(bucket) {
-            let count = self.heavy[idx].count;
+            let count = self.heavy[idx].count as u64;
             if count < min_count {
                 min_idx = idx;
                 min_count = count;
@@ -662,33 +715,39 @@ impl<T: Ord + Clone + Hash> CuckooTopK<T> {
         (min_idx, min_count)
     }
 
-    fn update_lobby(&mut self, bucket: usize, fingerprint: u64, increment: u64) -> Option<u64> {
+    fn update_lobby(&mut self, bucket: usize, fingerprint: Fp, increment: u64) -> Option<u64> {
         let lobby = &mut self.lobbies[bucket];
         if lobby.count == 0 || lobby.fingerprint == fingerprint {
             lobby.fingerprint = fingerprint;
-            lobby.count = lobby.count.saturating_add(increment);
-            return Some(lobby.count);
+            lobby.count = narrow_count((lobby.count as u64).saturating_add(increment));
+            return Some(lobby.count as u64);
         }
 
         self.decay_lobby_and_maybe_replace(bucket, fingerprint, increment)
     }
 
-    fn clear_lobby(&mut self, bucket: usize, fingerprint: u64) {
+    fn clear_lobby(&mut self, bucket: usize, fingerprint: Fp) {
         let lobby = &mut self.lobbies[bucket];
         if lobby.fingerprint == fingerprint {
             *lobby = Cell::default();
         }
     }
 
-    fn promote(&mut self, fingerprint: u64, count: u64, primary: usize, alternate: usize) -> bool {
+    fn promote(&mut self, fingerprint: Fp, count: u64, primary: usize, alternate: usize) -> bool {
         if let Some(idx) = self.find_empty_heavy_in_bucket(primary) {
-            self.heavy[idx] = Cell { fingerprint, count };
+            self.heavy[idx] = Cell {
+                fingerprint,
+                count: narrow_count(count),
+            };
             return true;
         }
 
         if alternate != primary {
             if let Some(idx) = self.find_empty_heavy_in_bucket(alternate) {
-                self.heavy[idx] = Cell { fingerprint, count };
+                self.heavy[idx] = Cell {
+                    fingerprint,
+                    count: narrow_count(count),
+                };
                 return true;
             }
         }
@@ -700,7 +759,10 @@ impl<T: Ord + Clone + Hash> CuckooTopK<T> {
 
         let victim_bucket = victim_idx / self.depth;
         let victim = self.heavy[victim_idx];
-        self.heavy[victim_idx] = Cell { fingerprint, count };
+        self.heavy[victim_idx] = Cell {
+            fingerprint,
+            count: narrow_count(count),
+        };
         self.relocate_victim(victim, victim_bucket);
         true
     }
@@ -711,7 +773,7 @@ impl<T: Ord + Clone + Hash> CuckooTopK<T> {
                 return;
             }
 
-            let (primary, alternate) = self.bucket_pair(victim.fingerprint);
+            let (primary, alternate) = self.bucket_pair(victim.fingerprint as u64);
             let target = if from_bucket == primary {
                 alternate
             } else {
@@ -727,7 +789,7 @@ impl<T: Ord + Clone + Hash> CuckooTopK<T> {
             }
 
             let (target_min_idx, target_min_count) = self.min_heavy_in_bucket(target);
-            if victim.count <= target_min_count {
+            if (victim.count as u64) <= target_min_count {
                 return;
             }
 
@@ -739,19 +801,19 @@ impl<T: Ord + Clone + Hash> CuckooTopK<T> {
     fn decay_lobby_and_maybe_replace(
         &mut self,
         bucket: usize,
-        fingerprint: u64,
+        fingerprint: Fp,
         increment: u64,
     ) -> Option<u64> {
         let mut remaining = increment;
         while remaining > 0 {
-            let current_count = self.lobbies[bucket].count;
+            let current_count = self.lobbies[bucket].count as u64;
             let threshold = self.decay_threshold(current_count);
             if self.rng.u64(..) < threshold {
                 let lobby = &mut self.lobbies[bucket];
-                lobby.count = lobby.count.saturating_sub(1);
+                lobby.count = narrow_count((lobby.count as u64).saturating_sub(1));
                 if lobby.count == 0 {
                     lobby.fingerprint = fingerprint;
-                    lobby.count = remaining;
+                    lobby.count = narrow_count(remaining);
                     return Some(remaining);
                 }
             }
@@ -763,6 +825,13 @@ impl<T: Ord + Clone + Hash> CuckooTopK<T> {
     fn decay_threshold(&self, count: u64) -> u64 {
         if count < self.decay_thresholds.len() as u64 {
             return self.decay_thresholds[count as usize];
+        }
+
+        // No precomputed table (`no-decay-table`): compute `decay^count`
+        // directly. `powf` of a fractional base underflows to 0 for large
+        // counts, matching the table's extrapolated tail.
+        if self.decay_thresholds.is_empty() {
+            return (self.decay.powf(count as f64) * u64::MAX as f64) as u64;
         }
 
         let tbl = &self.decay_thresholds;
@@ -1081,7 +1150,9 @@ mod tests {
         let cell = std::mem::size_of::<Cell>();
         let lobbies = 64 * cell;
         let heavy = 64 * 3 * cell;
-        let decay = DECAY_LOOKUP_SIZE * std::mem::size_of::<u64>();
+        // The table size varies with the decay-table feature; use the actual
+        // configured length so short/no-table builds stay correct.
+        let decay = decay_table_len(0.9) * std::mem::size_of::<u64>();
         // The fixed sketch arrays are exact; the priority queue adds more.
         assert!(topk.mem_bytes(|_| 0) >= lobbies + heavy + decay);
     }
@@ -1162,12 +1233,15 @@ mod tests {
 
     #[test]
     fn test_add_count_saturates_on_overflow() {
+        // Counts saturate at the stored counter's max (`Cnt::MAX`), which is
+        // u32::MAX under `narrow-cells` and u64::MAX otherwise.
+        let cnt_max = Cnt::MAX as u64;
         let mut topk: CuckooTopK<Vec<u8>> = CuckooTopK::new(2, 1, 1, 0.9);
         topk.add(&b"x".to_vec(), u64::MAX);
         topk.add(&b"x".to_vec(), 1);
-        assert_eq!(topk.count(&b"x".to_vec()), u64::MAX);
+        assert_eq!(topk.count(&b"x".to_vec()), cnt_max);
         topk.add(&b"x".to_vec(), 1_000_000);
-        assert_eq!(topk.count(&b"x".to_vec()), u64::MAX);
+        assert_eq!(topk.count(&b"x".to_vec()), cnt_max);
     }
 
     #[test]
@@ -1660,6 +1734,8 @@ mod tests {
     // `serialization.rs`; the variant-wiring and `max_kicks` checks are here.
 
     // Pins the wiring: another variant's payload must be rejected.
+    // (The `TopK` variant is compiled out of the narrow-cells build.)
+    #[cfg(not(feature = "narrow-cells"))]
     #[test]
     fn test_deserialize_rejects_other_variant() {
         let other = crate::TopK::<Vec<u8>>::with_seed(10, 64, 4, 0.9, 42).to_bytes();

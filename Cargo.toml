@@ -20,6 +20,17 @@ name = "heavykeeper"
 path = "src/lib.rs"
 
 
+[features]
+default = []
+# Store cell fingerprint and count as u32 instead of u64 (8 bytes/cell vs 16),
+# halving the bucket-array footprint. Changes the serialized byte layout.
+narrow-cells = []
+# Shrink the precomputed decay-threshold lookup table to the smallest size that
+# still covers the meaningful decay range for the configured factor.
+short-decay-table = []
+# Drop the decay-threshold lookup table entirely and compute decay on the fly.
+no-decay-table = []
+
 [dependencies]
 fastrand = "2"
 ahash = "0.8.11"

@@ -51,25 +51,41 @@ pub(crate) const VERSION: u8 = 1;
 /// so a payload only loads on the same architecture and `ahash` version that
 /// wrote it; otherwise the probe mismatches and load fails with `HasherMismatch`.
 pub(crate) const SERIALIZE_HASHER_PROBE: &[u8] = b"heavykeeper-serialize-hasher-probe";
-/// Bytes per serialized cell: `(fingerprint: u64, count: u64)`.
-pub(crate) const CELL_SIZE: usize = 16;
+/// Width of a stored cell fingerprint and counter. Selected at compile time:
+/// the default build uses `u64` (16 bytes/cell); the `narrow-cells` feature
+/// switches both to `u32` (8 bytes/cell, 2x memory savings on the bucket
+/// arrays). The full-width hash still flows through the `add` path as `u64`;
+/// only the *stored* fingerprint and count are narrowed. See `cuckoo.rs`.
+#[cfg(not(feature = "narrow-cells"))]
+pub(crate) type Fp = u64;
+#[cfg(not(feature = "narrow-cells"))]
+pub(crate) type Cnt = u64;
+#[cfg(feature = "narrow-cells")]
+pub(crate) type Fp = u32;
+#[cfg(feature = "narrow-cells")]
+pub(crate) type Cnt = u32;
+
+/// Bytes per serialized cell: `(fingerprint: Fp, count: Cnt)`. Tracks the
+/// compile-time cell width so the byte layout stays in sync with `Cell`.
+pub(crate) const CELL_SIZE: usize = std::mem::size_of::<Fp>() + std::mem::size_of::<Cnt>();
 /// Bytes in a serialized `fastrand::Rng` state (its 64-bit seed, little-endian).
 pub(crate) const RNG_STATE_SIZE: usize = 8;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug)]
 pub(crate) struct Cell {
-    pub(crate) fingerprint: u64,
-    pub(crate) count: u64,
+    pub(crate) fingerprint: Fp,
+    pub(crate) count: Cnt,
 }
 
 /// Parse a `CELL_SIZE`-aligned slice into a boxed cell array.
 pub(crate) fn parse_cells(slice: &[u8]) -> Box<[Cell]> {
+    const FP: usize = std::mem::size_of::<Fp>();
     slice
         .chunks_exact(CELL_SIZE)
         .map(|chunk| Cell {
-            fingerprint: u64::from_le_bytes(chunk[0..8].try_into().expect("8 bytes")),
-            count: u64::from_le_bytes(chunk[8..16].try_into().expect("8 bytes")),
+            fingerprint: Fp::from_le_bytes(chunk[0..FP].try_into().expect("Fp bytes")),
+            count: Cnt::from_le_bytes(chunk[FP..CELL_SIZE].try_into().expect("Cnt bytes")),
         })
         .collect()
 }
