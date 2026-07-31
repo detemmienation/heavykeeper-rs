@@ -29,7 +29,7 @@ pub(crate) struct TopKQueue<T> {
     table_mask: u32,
     capacity: usize,
     len: usize,
-    sequence: u64,
+    sequence: u32,
     hasher: RandomState,
 }
 
@@ -37,7 +37,7 @@ pub(crate) struct TopKQueue<T> {
 struct Slot<T> {
     item: T,
     count: u64,
-    sequence: u64,
+    sequence: u32,
     heap_pos: u32,
 }
 
@@ -178,7 +178,7 @@ impl<T: Ord + Clone + Hash + PartialEq> TopKQueue<T> {
 
             let slot_idx = self.len as u32;
             let heap_pos = self.len as u32;
-            self.sequence += 1;
+            self.sequence = self.sequence.wrapping_add(1);
 
             self.slots.push(Slot {
                 item,
@@ -206,7 +206,7 @@ impl<T: Ord + Clone + Hash + PartialEq> TopKQueue<T> {
                 // Replace slot contents
                 let old_item = std::mem::replace(&mut self.slots[min_slot_idx].item, item);
                 self.slots[min_slot_idx].count = count;
-                self.sequence += 1;
+                self.sequence = self.sequence.wrapping_add(1);
                 self.slots[min_slot_idx].sequence = self.sequence;
 
                 // Insert new item into hash table
