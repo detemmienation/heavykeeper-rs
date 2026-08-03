@@ -20,6 +20,9 @@ name = "heavykeeper"
 path = "src/lib.rs"
 
 
+[features]
+linear-pq = []
+
 [dependencies]
 fastrand = "2"
 ahash = "0.8.11"
@@ -45,4 +48,8 @@ harness = false
 
 [[bench]]
 name = "topk_vs_bucketed"
+harness = false
+
+[[bench]]
+name = "pq_lookup_mode"
 harness = false

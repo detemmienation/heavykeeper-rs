@@ -13,23 +13,31 @@ fn realloc_vec<E, R: Reallocator>(vec: &mut Vec<E>, reallocator: &mut R) {
     *vec = boxed.into_vec();
 }
 
+#[cfg(not(feature = "linear-pq"))]
 const EMPTY: u32 = u32::MAX;
 
 /// A specialized min-heap priority queue for HeavyKeeper's top-k tracking.
 ///
-/// Items are stored **once** in a dense `slots` array. A compact open-addressing
-/// hash table maps items to slot indices for O(1) lookup; a `Vec<u32>` binary
+/// Items are stored **once** in a dense `slots` array. A `Vec<u32>` binary
 /// heap (of slot indices, ordered by count) provides O(1) min and O(log k)
 /// insert/update.
+///
+/// **Lookup strategy** (compile-time):
+/// - Default: open-addressing hash table for O(1) lookup.
+/// - `feature = "linear-pq"`: linear scan over slots (better cache locality
+///   for small K, avoids hash computation on the lookup path).
 #[derive(Clone)]
 pub(crate) struct TopKQueue<T> {
     slots: Vec<Slot<T>>,
     heap: Vec<u32>,
+    #[cfg(not(feature = "linear-pq"))]
     table: Box<[u32]>,
+    #[cfg(not(feature = "linear-pq"))]
     table_mask: u32,
     capacity: usize,
     len: usize,
     sequence: u32,
+    #[cfg_attr(feature = "linear-pq", allow(dead_code))]
     hasher: RandomState,
 }
 
@@ -43,11 +51,14 @@ struct Slot<T> {
 
 impl<T: Ord + Clone + Hash + PartialEq> TopKQueue<T> {
     pub(crate) fn with_capacity_and_hasher(capacity: usize, hasher: RandomState) -> Self {
+        #[cfg(not(feature = "linear-pq"))]
         let table_size = table_size_for(capacity);
         Self {
             slots: Vec::with_capacity(capacity),
             heap: Vec::with_capacity(capacity + 1),
+            #[cfg(not(feature = "linear-pq"))]
             table: vec![EMPTY; table_size].into_boxed_slice(),
+            #[cfg(not(feature = "linear-pq"))]
             table_mask: (table_size as u32).wrapping_sub(1),
             capacity,
             len: 0,
@@ -78,7 +89,10 @@ impl<T: Ord + Clone + Hash + PartialEq> TopKQueue<T> {
         use std::mem::size_of;
         let slot_bytes = self.slots.capacity() * size_of::<Slot<T>>();
         let heap_bytes = self.heap.capacity() * size_of::<u32>();
+        #[cfg(not(feature = "linear-pq"))]
         let table_bytes = self.table.len() * size_of::<u32>();
+        #[cfg(feature = "linear-pq")]
+        let table_bytes = 0;
         let item_bytes: usize = self.slots[..self.len].iter().map(|s| item_heap(&s.item)).sum();
         slot_bytes + heap_bytes + table_bytes + item_bytes
     }
@@ -93,6 +107,7 @@ impl<T: Ord + Clone + Hash + PartialEq> TopKQueue<T> {
     ) {
         realloc_vec(&mut self.heap, reallocator);
         realloc_vec(&mut self.slots, reallocator);
+        #[cfg(not(feature = "linear-pq"))]
         realloc_large_heap_allocated_object(&mut self.table, reallocator);
     }
 
@@ -101,7 +116,11 @@ impl<T: Ord + Clone + Hash + PartialEq> TopKQueue<T> {
         T: Borrow<Q>,
         Q: Hash + Eq + ToOwned<Owned = T> + ?Sized,
     {
-        self.find_slot(item).map(|idx| self.slots[idx].count)
+        #[cfg(not(feature = "linear-pq"))]
+        let idx = self.find_slot(item);
+        #[cfg(feature = "linear-pq")]
+        let idx = self.find_slot_linear(item);
+        idx.map(|i| self.slots[i].count)
     }
 
     pub(crate) fn contains<Q>(&self, item: &Q) -> bool
@@ -109,7 +128,10 @@ impl<T: Ord + Clone + Hash + PartialEq> TopKQueue<T> {
         T: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        self.find_slot_eq(item).is_some()
+        #[cfg(not(feature = "linear-pq"))]
+        return self.find_slot_eq(item).is_some();
+        #[cfg(feature = "linear-pq")]
+        return self.find_slot_linear(item).is_some();
     }
 
     /// Increase an existing entry's count. Caller must guarantee the new count
@@ -119,7 +141,12 @@ impl<T: Ord + Clone + Hash + PartialEq> TopKQueue<T> {
         T: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        if let Some(slot_idx) = self.find_slot_eq(item) {
+        #[cfg(not(feature = "linear-pq"))]
+        let found = self.find_slot_eq(item);
+        #[cfg(feature = "linear-pq")]
+        let found = self.find_slot_linear(item);
+
+        if let Some(slot_idx) = found {
             let slot = &mut self.slots[slot_idx];
             debug_assert!(count >= slot.count, "update_if_present must not decrease");
             if count == slot.count {
@@ -151,10 +178,15 @@ impl<T: Ord + Clone + Hash + PartialEq> TopKQueue<T> {
     /// Returns `Some(evicted)` when a previously tracked item is displaced
     /// by this call, otherwise `None`.
     pub(crate) fn upsert(&mut self, item: T, count: u64) -> Option<T> {
-        let hash = self.hasher.hash_one(&item);
-
         // Fast path: update existing item
-        if let Some(slot_idx) = self.find_slot_with_hash(&item, hash) {
+        #[cfg(not(feature = "linear-pq"))]
+        let hash = self.hasher.hash_one(&item);
+        #[cfg(not(feature = "linear-pq"))]
+        let existing = self.find_slot_with_hash(&item, hash);
+        #[cfg(feature = "linear-pq")]
+        let existing = self.find_slot_linear(&item);
+
+        if let Some(slot_idx) = existing {
             let slot = &mut self.slots[slot_idx];
             if count == slot.count {
                 return None;
@@ -189,6 +221,7 @@ impl<T: Ord + Clone + Hash + PartialEq> TopKQueue<T> {
             self.heap.push(slot_idx);
             self.len += 1;
 
+            #[cfg(not(feature = "linear-pq"))]
             self.table_insert(hash, slot_idx);
             self.sift_up(heap_pos as usize);
             return None;
@@ -199,20 +232,20 @@ impl<T: Ord + Clone + Hash + PartialEq> TopKQueue<T> {
             let min_slot_idx = self.heap[0] as usize;
             let min_count = self.slots[min_slot_idx].count;
             if count > min_count {
-                // Remove old item from hash table
-                let old_hash = self.hasher.hash_one(&self.slots[min_slot_idx].item);
-                self.table_remove(old_hash, min_slot_idx as u32);
+                #[cfg(not(feature = "linear-pq"))]
+                {
+                    let old_hash = self.hasher.hash_one(&self.slots[min_slot_idx].item);
+                    self.table_remove(old_hash, min_slot_idx as u32);
+                }
 
-                // Replace slot contents
                 let old_item = std::mem::replace(&mut self.slots[min_slot_idx].item, item);
                 self.slots[min_slot_idx].count = count;
                 self.sequence = self.sequence.wrapping_add(1);
                 self.slots[min_slot_idx].sequence = self.sequence;
 
-                // Insert new item into hash table
+                #[cfg(not(feature = "linear-pq"))]
                 self.table_insert(hash, min_slot_idx as u32);
 
-                // Re-heapify
                 self.sift_down(0);
                 return Some(old_item);
             }
@@ -247,13 +280,32 @@ impl<T: Ord + Clone + Hash + PartialEq> TopKQueue<T> {
         items.into_iter().map(|(k, count, _)| (k, count))
     }
 
+    // --- Linear scan lookup (feature = "linear-pq") ---
+
+    #[cfg(feature = "linear-pq")]
+    #[inline]
+    fn find_slot_linear<Q>(&self, item: &Q) -> Option<usize>
+    where
+        T: Borrow<Q>,
+        Q: Eq + ?Sized,
+    {
+        for i in 0..self.len {
+            if self.slots[i].item.borrow() == item {
+                return Some(i);
+            }
+        }
+        None
+    }
+
     // --- Hash table operations (open addressing, linear probing) ---
 
+    #[cfg(not(feature = "linear-pq"))]
     #[inline]
     fn table_bucket(&self, hash: u64) -> usize {
         (hash as u32 & self.table_mask) as usize
     }
 
+    #[cfg(not(feature = "linear-pq"))]
     fn find_slot<Q>(&self, item: &Q) -> Option<usize>
     where
         T: Borrow<Q>,
@@ -263,6 +315,7 @@ impl<T: Ord + Clone + Hash + PartialEq> TopKQueue<T> {
         self.find_slot_with_hash(item, hash)
     }
 
+    #[cfg(not(feature = "linear-pq"))]
     fn find_slot_eq<Q>(&self, item: &Q) -> Option<usize>
     where
         T: Borrow<Q>,
@@ -272,6 +325,7 @@ impl<T: Ord + Clone + Hash + PartialEq> TopKQueue<T> {
         self.find_slot_with_hash(item, hash)
     }
 
+    #[cfg(not(feature = "linear-pq"))]
     #[inline]
     fn find_slot_with_hash<Q>(&self, item: &Q, hash: u64) -> Option<usize>
     where
@@ -291,6 +345,7 @@ impl<T: Ord + Clone + Hash + PartialEq> TopKQueue<T> {
         }
     }
 
+    #[cfg(not(feature = "linear-pq"))]
     fn table_insert(&mut self, hash: u64, slot_idx: u32) {
         let mut bucket = self.table_bucket(hash);
         loop {
@@ -302,6 +357,7 @@ impl<T: Ord + Clone + Hash + PartialEq> TopKQueue<T> {
         }
     }
 
+    #[cfg(not(feature = "linear-pq"))]
     fn table_remove(&mut self, hash: u64, slot_idx: u32) {
         let mut bucket = self.table_bucket(hash);
         loop {
@@ -388,6 +444,7 @@ impl<T: Ord + Clone + Hash + PartialEq> TopKQueue<T> {
 
 /// Determine if `natural` is "between" `vacancy` and `current` in the circular
 /// probe sequence, meaning this entry should be shifted back to fill the vacancy.
+#[cfg(not(feature = "linear-pq"))]
 #[inline]
 fn wraps_around(natural: usize, vacancy: usize, current: usize, _len: usize) -> bool {
     if vacancy <= current {
@@ -401,6 +458,7 @@ fn wraps_around(natural: usize, vacancy: usize, current: usize, _len: usize) -> 
 
 /// Compute the hash table size (power of 2) for a given queue capacity.
 /// Uses ~2x overprovisioning for a low load factor.
+#[cfg(not(feature = "linear-pq"))]
 fn table_size_for(capacity: usize) -> usize {
     let min = if capacity < 4 { 8 } else { capacity * 2 };
     min.next_power_of_two()
