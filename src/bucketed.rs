@@ -236,13 +236,8 @@ impl<T: Ord + Clone + Hash> BucketedTopK<T> {
             None => return (None, false),
         };
 
-        // Paper Algorithm 1: heap value is max(maxv, existing_heap_value).
-        // Item already in PQ → only raise; cell-decay must not drag PQ down.
-        if let Some(current) = self.priority_queue.get(item) {
-            if max_count > current {
-                self.priority_queue.update_if_present(item, max_count);
-                self.min_pq_count = self.priority_queue.min_count();
-            }
+        if self.priority_queue.update_if_present(item, max_count) {
+            self.min_pq_count = self.priority_queue.min_count();
             return (None, false);
         }
 

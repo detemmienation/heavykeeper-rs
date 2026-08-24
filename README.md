@@ -51,9 +51,9 @@ The crate ships three top-K sketches that share the same public API
 
 | Sketch          | Layout                                           | Insert throughput on Zipf(s=1.2), 1M | Recall @ φ=0.0005 |
 | --------------- | ------------------------------------------------ | -----------------------------------: | ----------------: |
-| `TopK`          | `depth` independent rows × `width` buckets        |                       21.0 Melem / s |             0.942 |
-| `BucketedTopK`  | one bucket of `depth` cells per key               |                       29.0 Melem / s |             0.985 |
-| `CuckooTopK`    | per-bucket lobby + `depth` heavy slots, 2-bucket cuckoo |                       29.8 Melem / s |             1.000 |
+| `TopK`          | `depth` independent rows × `width` buckets        |                       21.9 Melem / s |             0.949 |
+| `BucketedTopK`  | one bucket of `depth` cells per key               |                       35.8 Melem / s |             0.985 |
+| `CuckooTopK`    | per-bucket lobby + `depth` heavy slots, 2-bucket cuckoo |                       35.0 Melem / s |             1.000 |
 
 Numbers are from `cargo bench --bench topk_vs_bucketed` at `K=100,
 width=4096, depth=4, decay=0.9` on `u64` keys. Recall is from
@@ -87,9 +87,9 @@ budgets across variants:
 
 | Sketch          | Width × depth          | Throughput | hit\_ratio | ARE on reported | ARE on true top-K |
 | --------------- | ---------------------- | ---------: | ---------: | --------------: | ----------------: |
-| `TopK`          | 16384 × 2              | 14.1 Mpps  |     0.9270 |          0.0050 |            0.0745 |
-| `BucketedTopK`  | 8192 × 4               | 18.1 Mpps  |     0.9860 |          0.0035 |            0.0129 |
-| `CuckooTopK`    | 8192 × (1 + 4 heavy)   | 17.0 Mpps  | **0.9990** |      **0.0012** |        **0.0012** |
+| `TopK`          | 16384 × 2              | 15.7 Mpps  |     0.9260 |          0.0054 |            0.0743 |
+| `BucketedTopK`  | 8192 × 4               | 20.7 Mpps  |     0.9860 |          0.0035 |            0.0129 |
+| `CuckooTopK`    | 8192 × (1 + 4 heavy)   | 18.4 Mpps  | **0.9990** |      **0.0012** |        **0.0012** |
 
 # Other HeavyKeeper Implementations
 

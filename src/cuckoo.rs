@@ -752,11 +752,8 @@ impl<T: Ord + Clone + Hash> CuckooTopK<T> {
         T: Borrow<Q>,
         Q: Hash + Eq + ToOwned<Owned = T> + ?Sized,
     {
-        if let Some(current) = self.priority_queue.get(item) {
-            if count > current {
-                self.priority_queue.update_if_present(item, count);
-                self.min_pq_count = self.priority_queue.min_count();
-            }
+        if self.priority_queue.update_if_present(item, count) {
+            self.min_pq_count = self.priority_queue.min_count();
             return (None, false);
         }
 
