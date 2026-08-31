@@ -504,7 +504,7 @@ impl TopK<Vec<u8>> {
     /// buckets:  depth  x  width  x (fingerprint: u64, count: u64)
     /// pq_len: u64
     /// pq:       pq_len       x (key_len: u64, key bytes, count: u64)
-    /// rng_state: 32 bytes
+    /// rng_state: 8 bytes  (fastrand seed)
     /// ```
     ///
     /// The seed is not stored; the hasher is rebuilt from the seed passed to
@@ -549,7 +549,8 @@ impl TopK<Vec<u8>> {
     /// `seed` must match the sketch's original seed; the hasher rebuilt from it.
     pub fn from_bytes(bytes: &[u8], seed: u64) -> Result<Self, TopKDeserializeError> {
         let mut reader = ByteReader::new(bytes);
-        reader.read_header(VARIANT, seed)?;
+        let probe = RandomState::with_seeds(seed, seed, seed, seed).hash_one(SERIALIZE_HASHER_PROBE);
+        reader.read_header(VARIANT, probe)?;
 
         let (width, depth, decay, top_items) = reader.read_params()?;
 

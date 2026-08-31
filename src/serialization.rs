@@ -1,6 +1,5 @@
 //! Shared byte-serialization error, constants, and readers for all variants.
 
-use ahash::RandomState;
 use thiserror::Error;
 
 /// Error returned by every variant's `from_bytes` (aliased per variant).
@@ -21,7 +20,7 @@ pub enum DeserializeError {
     #[error("Payload is a different sketch variant: got tag {actual} (expected {expected})")]
     WrongVariant { expected: u8, actual: u8 },
 
-    #[error("Hasher mismatch: seed produces probe {actual} but payload holds {expected} (wrong seed, or the payload was written with a different ahash version)")]
+    #[error("Hasher mismatch: the supplied hasher produces probe {actual} but the payload holds {expected} (wrong seed, a different hasher, or a different ahash version/architecture)")]
     HasherMismatch { expected: u64, actual: u64 },
 
     #[error("Unsupported serialization version {version} (this build expects {expected})")]
@@ -43,7 +42,15 @@ pub enum DeserializeError {
 
 /// Magic tag at the start of every serialized sketch (`b"HVYK"`).
 pub(crate) const MAGIC: [u8; 4] = *b"HVYK";
-/// On-disk format version. Bump whenever the byte layout changes.
+/// On-disk format version.
+///
+/// Bump whenever the byte layout changes, OR when the interpretation of any
+/// field changes even though no bytes move — including the RNG algorithm
+/// behind `rng_state` (see `fastrand_stream_is_pinned`) and the hash family
+/// behind the fingerprints and `hasher_probe`. A payload's `rng_state` cannot
+/// be translated across RNG algorithms; a future loader migrating an old
+/// version should reuse the stored bytes as a fresh seed (replication pairs
+/// must full-resync across such an upgrade).
 pub(crate) const VERSION: u8 = 1;
 /// Probe hashed at serialize time to detect a wrong seed on load.
 ///
@@ -134,9 +141,12 @@ impl<'a> ByteReader<'a> {
     }
 
     /// Verify the fixed header shared by every variant: magic, `variant` tag,
-    /// version, and the hasher probe. Rebuilds the hasher from `seed` and
-    /// rejects a wrong seed before any params are parsed.
-    pub(crate) fn read_header(&mut self, variant: u8, seed: u64) -> Result<(), DeserializeError> {
+    /// version, and the hasher probe. `probe` is the caller's hash of
+    /// [`SERIALIZE_HASHER_PROBE`] with the hasher it intends to restore with;
+    /// a mismatch against the stored probe rejects the payload before any
+    /// params are parsed. Taking the probe (not a seed) keeps this module
+    /// hasher-agnostic — any `BuildHasher` can produce one via `hash_one`.
+    pub(crate) fn read_header(&mut self, variant: u8, probe: u64) -> Result<(), DeserializeError> {
         let magic = self.take_array::<4>("magic")?;
         if magic != MAGIC {
             return Err(DeserializeError::BadMagic {
@@ -158,13 +168,11 @@ impl<'a> ByteReader<'a> {
                 expected: VERSION,
             });
         }
-        let expected_probe = self.take_u64("hasher_probe")?;
-        let actual_probe =
-            RandomState::with_seeds(seed, seed, seed, seed).hash_one(SERIALIZE_HASHER_PROBE);
-        if actual_probe != expected_probe {
+        let stored_probe = self.take_u64("hasher_probe")?;
+        if probe != stored_probe {
             return Err(DeserializeError::HasherMismatch {
-                expected: expected_probe,
-                actual: actual_probe,
+                expected: stored_probe,
+                actual: probe,
             });
         }
         Ok(())
@@ -213,9 +221,15 @@ impl<'a> ByteReader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ahash::RandomState;
 
     const SEED: u64 = 42;
     const VARIANT: u8 = 0;
+
+    /// Probe for `seed`, matching what `from_bytes` computes.
+    fn probe_for(seed: u64) -> u64 {
+        RandomState::with_seeds(seed, seed, seed, seed).hash_one(SERIALIZE_HASHER_PROBE)
+    }
 
     /// Build a valid header (magic, variant, version, probe) for `SEED`.
     fn header(variant: u8) -> Vec<u8> {
@@ -223,9 +237,7 @@ mod tests {
         out.extend_from_slice(&MAGIC);
         out.push(variant);
         out.push(VERSION);
-        let probe =
-            RandomState::with_seeds(SEED, SEED, SEED, SEED).hash_one(SERIALIZE_HASHER_PROBE);
-        out.extend_from_slice(&probe.to_le_bytes());
+        out.extend_from_slice(&probe_for(SEED).to_le_bytes());
         out
     }
 
@@ -235,7 +247,7 @@ mod tests {
         bytes[0] ^= 0xff;
         let mut r = ByteReader::new(&bytes);
         assert!(matches!(
-            r.read_header(VARIANT, SEED),
+            r.read_header(VARIANT, probe_for(SEED)),
             Err(DeserializeError::BadMagic { .. })
         ));
     }
@@ -245,7 +257,7 @@ mod tests {
         let bytes = header(VARIANT + 1);
         let mut r = ByteReader::new(&bytes);
         assert!(matches!(
-            r.read_header(VARIANT, SEED),
+            r.read_header(VARIANT, probe_for(SEED)),
             Err(DeserializeError::WrongVariant { .. })
         ));
     }
@@ -256,7 +268,7 @@ mod tests {
         bytes[5] = VERSION + 1;
         let mut r = ByteReader::new(&bytes);
         assert!(matches!(
-            r.read_header(VARIANT, SEED),
+            r.read_header(VARIANT, probe_for(SEED)),
             Err(DeserializeError::UnsupportedVersion { .. })
         ));
     }
@@ -266,7 +278,7 @@ mod tests {
         let bytes = header(VARIANT);
         let mut r = ByteReader::new(&bytes);
         assert!(matches!(
-            r.read_header(VARIANT, SEED + 1),
+            r.read_header(VARIANT, probe_for(SEED + 1)),
             Err(DeserializeError::HasherMismatch { .. })
         ));
     }
@@ -276,7 +288,7 @@ mod tests {
         let bytes = header(VARIANT);
         let mut r = ByteReader::new(&bytes[..bytes.len() - 1]);
         assert!(matches!(
-            r.read_header(VARIANT, SEED),
+            r.read_header(VARIANT, probe_for(SEED)),
             Err(DeserializeError::UnexpectedEof { .. })
         ));
     }
@@ -329,5 +341,90 @@ mod tests {
             r.finish(),
             Err(DeserializeError::TrailingBytes { count: 1 })
         ));
+    }
+
+    /// Golden-stream test: pins `fastrand`'s output for a fixed seed.
+    ///
+    /// A payload's `rng_state` only keeps a restored replica in decay-lockstep
+    /// with its primary if both draw the same stream from the same state. Every
+    /// other test compares a sketch against itself, so a fastrand release that
+    /// changed its generator (as 1.x -> 2.0 did) would pass the whole suite
+    /// while silently breaking mixed-version replication.
+    ///
+    /// If this fails: the RNG stream changed. Bump [`VERSION`] (see its doc for
+    /// the migration rule) — do not just update the constants.
+    #[test]
+    fn fastrand_stream_is_pinned() {
+        let mut rng = fastrand::Rng::with_seed(42);
+        assert_eq!(
+            [rng.u64(..), rng.u64(..), rng.u64(..)],
+            [
+                0xca71d87c76983989,
+                0x7e5ba61552085fc6,
+                0xcdf101e3bab88b9f,
+            ],
+            "fastrand's output stream changed for a fixed seed"
+        );
+        // `get_seed` must expose the raw state: with_seed(get_seed()) is how
+        // `from_bytes` resumes the stream exactly.
+        let mut a = fastrand::Rng::with_seed(7);
+        let _ = a.u64(..);
+        let mut b = fastrand::Rng::with_seed(a.get_seed());
+        assert_eq!(a.u64(..), b.u64(..), "state round-trip must resume the stream");
+    }
+
+    /// Golden-bytes test: pins the serialized layout of an empty `TopK`.
+    ///
+    /// The round-trip tests can't catch a format change that alters write and
+    /// read symmetrically; this hardcodes the bytes so any layout drift fails
+    /// loudly. The `hasher_probe` field (bytes 6..14) is checked against a
+    /// live hash rather than a constant because ahash output is
+    /// architecture-dependent; everything else is fixed.
+    ///
+    /// If this fails: the on-disk format changed. Bump [`VERSION`] and update
+    /// the layout docs on every variant's `to_bytes` — do not just update the
+    /// constants.
+    #[test]
+    fn topk_layout_is_pinned() {
+        let bytes = crate::TopK::<Vec<u8>>::with_seed(3, 2, 1, 0.9, SEED).to_bytes();
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"HVYK"); // magic
+        expected.push(0); // variant: TopK
+        expected.push(1); // version
+        expected.extend_from_slice(&probe_for(SEED).to_le_bytes()); // hasher_probe
+        expected.extend_from_slice(&2u64.to_le_bytes()); // width
+        expected.extend_from_slice(&1u64.to_le_bytes()); // depth
+        expected.extend_from_slice(&0x3FECCCCCCCCCCCCDu64.to_le_bytes()); // decay = 0.9f64 bits
+        expected.extend_from_slice(&3u64.to_le_bytes()); // top_items
+        expected.extend_from_slice(&[0u8; 2 * 16]); // 2x1 empty cells
+        expected.extend_from_slice(&0u64.to_le_bytes()); // pq_len
+        expected.extend_from_slice(&42u64.to_le_bytes()); // rng_state = unadvanced seed
+
+        assert_eq!(bytes, expected, "TopK serialized layout changed");
+    }
+
+    /// Golden-bytes test for `CuckooTopK` (the variant valkey-bloom persists):
+    /// same rules as `topk_layout_is_pinned`.
+    #[test]
+    fn cuckoo_layout_is_pinned() {
+        let bytes = crate::CuckooTopK::<Vec<u8>>::with_seed(3, 2, 1, 0.9, SEED).to_bytes();
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"HVYK"); // magic
+        expected.push(2); // variant: CuckooTopK
+        expected.push(1); // version
+        expected.extend_from_slice(&probe_for(SEED).to_le_bytes()); // hasher_probe
+        expected.extend_from_slice(&2u64.to_le_bytes()); // width
+        expected.extend_from_slice(&1u64.to_le_bytes()); // depth
+        expected.extend_from_slice(&0x3FECCCCCCCCCCCCDu64.to_le_bytes()); // decay = 0.9f64 bits
+        expected.extend_from_slice(&3u64.to_le_bytes()); // top_items
+        expected.extend_from_slice(&8u64.to_le_bytes()); // max_kicks (default)
+        expected.extend_from_slice(&[0u8; 2 * 16]); // 2 empty lobby cells
+        expected.extend_from_slice(&[0u8; 2 * 16]); // 2x1 empty heavy cells
+        expected.extend_from_slice(&0u64.to_le_bytes()); // pq_len
+        expected.extend_from_slice(&42u64.to_le_bytes()); // rng_state = unadvanced seed
+
+        assert_eq!(bytes, expected, "CuckooTopK serialized layout changed");
     }
 }
