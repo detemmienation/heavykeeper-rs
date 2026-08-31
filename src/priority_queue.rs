@@ -99,16 +99,18 @@ impl<T: Ord + Clone + Hash + PartialEq> TopKQueue<T> {
         self.items.contains_key(item)
     }
 
-    /// Increase an existing entry's count. Caller must guarantee the new count
-    /// is >= the current count (paper Algorithm 1: heap is max(maxv, existing)).
+    /// Update an existing entry's count to `count`, if `item` is tracked.
+    ///
+    /// Returns `true` if `item` is present (whether or not this call
+    /// actually raised its count), `false` if it isn't tracked at all —
+    #[inline]
     pub(crate) fn update_if_present<Q>(&mut self, item: &Q, count: u64) -> bool
     where
         T: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
         if let Some((old_count, pos)) = self.items.get_mut(item) {
-            debug_assert!(count >= *old_count, "update_if_present must not decrease");
-            if count == *old_count {
+            if count <= *old_count {
                 return true;
             }
             *old_count = count;

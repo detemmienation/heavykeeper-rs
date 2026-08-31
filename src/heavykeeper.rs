@@ -348,12 +348,7 @@ impl<T: Ord + Clone + Hash> TopK<T> {
             }
         }
 
-        // Paper Algorithm 1: heap value is max(maxv, existing_heap_value).
-        // Item already in PQ → only raise; sketch readings must not drag PQ down.
-        if let Some(current) = self.priority_queue.get(item) {
-            if max_count > current {
-                self.priority_queue.update_if_present(item, max_count);
-            }
+        if self.priority_queue.update_if_present(item, max_count) {
             return (None, false);
         }
 
