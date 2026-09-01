@@ -3,16 +3,7 @@ use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::hash::Hash;
 
-use crate::cuckoo::{realloc_large_heap_allocated_object, Reallocator};
-
-/// Relocate `vec`'s backing allocation through `reallocator`, in place. Trimmed
-/// to a boxed slice first to drop spare capacity; the rebuilt `Vec` has
-/// capacity equal to its length.
-fn realloc_vec<E, R: Reallocator>(vec: &mut Vec<E>, reallocator: &mut R) {
-    let mut boxed = std::mem::take(vec).into_boxed_slice();
-    realloc_large_heap_allocated_object(&mut boxed, reallocator);
-    *vec = boxed.into_vec();
-}
+use crate::defrag::{realloc_vec, Reallocator};
 
 /// A specialized priority queue for HeavyKeeper that maintains top-k items by count
 #[derive(Clone)]

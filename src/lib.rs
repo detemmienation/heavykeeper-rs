@@ -14,7 +14,7 @@ pub use bucketed::{
 
 mod cuckoo;
 pub use cuckoo::{
-    CuckooBuilderError, CuckooDeserializeError, CuckooMergeError, CuckooNode, CuckooTopK, Reallocator,
+    CuckooBuilderError, CuckooDeserializeError, CuckooMergeError, CuckooNode, CuckooTopK,
 };
 
 mod hash_composition;
@@ -22,3 +22,6 @@ mod priority_queue;
 
 mod serialization;
 pub use serialization::DeserializeError;
+
+mod defrag;
+pub use defrag::Reallocator;

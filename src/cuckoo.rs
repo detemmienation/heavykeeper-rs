@@ -17,28 +17,12 @@ use thiserror::Error;
 
 use crate::priority_queue::TopKQueue;
 use crate::serialization::*;
+use crate::defrag::{realloc_large_heap_allocated_object, Reallocator};
 
 const DECAY_LOOKUP_SIZE: usize = 1024;
 
 /// Variant tag for `CuckooTopK` in the serialized header.
 const VARIANT: u8 = 2;
-
-/// Relocates the sketch's large heap allocations for a host running active
-/// memory defragmentation. One generic method covers every element type, so
-/// the sketch's private types need not be named by the caller.
-pub trait Reallocator {
-    /// Relocate `boxed`, returning an equal-length, equal-contents `Box<[T]>`.
-    fn realloc<T>(&mut self, boxed: Box<[T]>) -> Box<[T]>;
-}
-
-/// Relocate the allocation backing `slot` through `reallocator`, in place.
-pub(crate) fn realloc_large_heap_allocated_object<E, R: Reallocator>(
-    slot: &mut Box<[E]>,
-    reallocator: &mut R,
-) {
-    // `mem::take` leaves an empty box, so nothing dangles if `reallocator` panics.
-    *slot = reallocator.realloc(std::mem::take(slot));
-}
 
 /// Default upper bound on the cuckoo kick chain. Higher values raise the
 /// effective load factor of the heavy slots (fewer silent drops on
@@ -571,9 +555,7 @@ impl<T: Ord + Clone + Hash> CuckooTopK<T> {
     /// Relocate the sketch's large heap allocations through `reallocator` (see
     /// [`Reallocator`]): the `lobbies` and `heavy` bucket arrays, the decay
     /// table, and the priority queue's vectors. Logical contents (counts,
-    /// tracked items, query results) are unchanged. Not panic-atomic: if
-    /// `reallocator` panics partway through, the sketch may be left logically
-    /// inconsistent.
+    /// tracked items, query results) are unchanged.
     pub fn realloc_large_heap_allocated_objects<R: Reallocator>(&mut self, reallocator: &mut R) {
         realloc_large_heap_allocated_object(&mut self.lobbies, reallocator);
         realloc_large_heap_allocated_object(&mut self.heavy, reallocator);
